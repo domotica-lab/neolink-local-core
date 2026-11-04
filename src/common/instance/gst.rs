@@ -91,18 +91,32 @@ impl NeoInstance {
             let thread_name2 = name.clone();
             tokio::spawn(
                 async move {
-                    loop {
+                    let res = loop {
                         log::debug!("{thread_name2}: Waiting for stream permit users");
-                        if let Err(e) = camera_permit.aquired_users().await {
-                            break AnyResult::Err(e);
+                        // Also stop if the consumer goes away while we are paused,
+                        // otherwise this task (and the motion task) would live forever.
+                        tokio::select! {
+                            v = camera_permit.aquired_users() => {
+                                if let Err(e) = v {
+                                    break AnyResult::Err(e);
+                                }
+                            }
+                            _ = media_tx.closed() => {
+                                log::info!("{thread_name2}::{stream:?}: Consumer closed while paused, stopping stream task");
+                                break AnyResult::Ok(());
+                            }
                         }
                         log::info!(
                             "{thread_name2}: Stream permit acquired, starting camera stream"
                         );
-                        tokio::select! {
+                        let closed = tokio::select! {
+                            _ = media_tx.closed() => {
+                                log::info!("{thread_name2}::{stream:?}: Consumer closed, stopping camera stream and releasing permit");
+                                Ok(true)
+                            },
                             v = camera_permit.dropped_users() => {
                                 log::debug!("{thread_name2}: Dropped users: {v:?}");
-                                v
+                                v.map(|_| false)
                             },
                             v = async {
                                 log::info!("{thread_name2}: Requesting stream from camera");
@@ -114,17 +128,24 @@ impl NeoInstance {
                                 AnyResult::Ok(())
                             } => {
                                 log::debug!("Stopped stream: {v:?}");
-                                v
+                                v.map(|_| false)
                             },
                             v = tasks.next() => {
                                 log::debug!("Task failed: {v:?}");
                                 Err(anyhow!("Task ended prematurly: {v:?}"))
                             }
                         }?;
+                        if closed {
+                            break AnyResult::Ok(());
+                        }
                         log::debug!("Pausing stream");
-                    }?;
+                    };
+                    // The motion listener is a detached task: stop it with us.
+                    for t in tasks.iter() {
+                        t.abort();
+                    }
                     drop(counter); // Make sure counter is owned by this thread
-                    AnyResult::Ok(())
+                    res
                 }
                 .map(|e| {
                     log::debug!("Stream thread stopped {e:?}");
@@ -141,32 +162,42 @@ impl NeoInstance {
     }
 
     /// Streams a camera source
+    ///
+    /// The spawned task holds a use-permit (via `run_task`) for as long as it
+    /// runs. It must therefore stop as soon as the consumer drops the returned
+    /// receiver, even if the camera is not connected yet or never sends another
+    /// frame (e.g. a second `start_video` on the same stream took over the
+    /// camera's media). Otherwise the permit leaks and an `on_demand` camera
+    /// never disconnects.
     pub(crate) async fn stream(&self, stream: StreamKind) -> AnyResult<MpscReceiver<BcMedia>> {
         let (media_tx, media_rx) = tokio::sync::mpsc::channel(MEDIA_CHANNEL_CAP);
         let config = self.config().await?.borrow().clone();
         let strict = config.strict;
+        let name = config.name.clone();
         let thread_camera = self.clone();
-        tokio::task::spawn(
-            tokio::task::spawn(async move {
-                thread_camera
-                    .run_task(move |cam| {
-                        let media_tx = media_tx.clone();
-                        Box::pin(async move {
-                            let mut media_stream = cam.start_video(stream, 0, strict).await?;
-                            log::trace!("Camera started");
-                            while let Ok(media) = media_stream.get_data().await? {
-                                media_tx.send(media).await?;
-                            }
-                            AnyResult::Ok(())
-                        })
+        tokio::task::spawn(async move {
+            let closed_tx = media_tx.clone();
+            let res = tokio::select! {
+                // Consumer gone: dropping the run_task future releases its permit
+                // and drops the camera StreamData (which sends the video stop).
+                _ = closed_tx.closed() => {
+                    log::info!("{name}::{stream:?}: Consumer closed, stopping camera stream task and releasing permit");
+                    AnyResult::Ok(())
+                }
+                v = thread_camera.run_task(move |cam| {
+                    let media_tx = media_tx.clone();
+                    Box::pin(async move {
+                        let mut media_stream = cam.start_video(stream, 0, strict).await?;
+                        log::trace!("Camera started");
+                        while let Ok(media) = media_stream.get_data().await? {
+                            media_tx.send(media).await?;
+                        }
+                        AnyResult::Ok(())
                     })
-                    .await
-            })
-            .and_then(|res| async move {
-                log::debug!("Camera finished streaming: {res:?}");
-                Ok(())
-            }),
-        );
+                }) => v,
+            };
+            log::debug!("{name}::{stream:?}: Camera finished streaming: {res:?}");
+        });
 
         Ok(media_rx)
     }
