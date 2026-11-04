@@ -615,7 +615,8 @@ impl UdpPayloadInner {
                         let last_id = self.recieved.keys().max().copied().unwrap_or(next_id);
                         let gap_len = next_id.saturating_sub(self.packets_want);
                         log::warn!(
-                            "UDP payload gap: skipping missing packets {}..{} (gap={}, wait={:?}, pending={}, max_id={})",
+                            "UDP payload gap from {}: skipping missing packets {}..{} (gap={}, wait={:?}, pending={}, max_id={})",
+                            self.camera_addr,
                             self.packets_want,
                             next_id.saturating_sub(1),
                             gap_len,

@@ -41,7 +41,7 @@ pub(crate) async fn stream_main(
 
     // Remove dummy factories from all paths first
     for path in paths.iter() {
-        log::info!("{}: Removing dummy factory from path: {}", name, path);
+        log::debug!("{}: Removing dummy factory from path: {}", name, path);
         mounts.remove_factory(path);
     }
 
@@ -56,7 +56,7 @@ pub(crate) async fn stream_main(
     factory.add_permitted_roles(users);
 
     for path in paths.iter() {
-        log::info!("{}: Mounting real factory at path: {}", name, path);
+        log::debug!("{}: Mounting real factory at path: {}", name, path);
         mounts.add_factory(path, factory.clone());
     }
     // Unmount these paths on teardown so a restarted/disabled stream doesn't leak.
