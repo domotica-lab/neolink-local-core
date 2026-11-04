@@ -61,6 +61,7 @@ use std::sync::Arc;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
+mod api;
 mod cmdline;
 mod factory;
 mod gst;
@@ -200,6 +201,11 @@ pub(crate) async fn main(_opt: Opt, reactor: NeoReactor) -> Result<()> {
             } => v,
         }
     });
+
+    // Local status API for the Home Assistant integration.
+    let api_cancel = global_cancel.clone();
+    let api_reactor = reactor.clone();
+    set.spawn(async move { api::serve(api_reactor, api_cancel).await });
 
     let rtsp_config = reactor.config().await?.borrow().clone();
     info!(

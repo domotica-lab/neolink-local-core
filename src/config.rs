@@ -33,6 +33,16 @@ pub(crate) struct Config {
     #[serde(default = "default_bind_port")]
     pub(crate) bind_port: u16,
 
+    /// Address of the local status API (camera state + still images that never
+    /// wake a camera). Loopback by default so only the local machine (Home
+    /// Assistant) can reach it.
+    #[serde(default = "default_api_bind")]
+    pub(crate) api_bind: String,
+
+    /// Port of the status API; 0 disables it.
+    #[serde(default = "default_api_port")]
+    pub(crate) api_port: u16,
+
     #[serde(default = "default_certificate")]
     pub(crate) certificate: Option<String>,
 
@@ -598,6 +608,14 @@ impl std::fmt::Display for SplashPattern {
 
 fn default_bind_addr() -> String {
     "0.0.0.0".to_string()
+}
+
+fn default_api_bind() -> String {
+    "127.0.0.1".to_string()
+}
+
+fn default_api_port() -> u16 {
+    8559
 }
 
 fn default_bind_port() -> u16 {

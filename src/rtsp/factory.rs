@@ -2969,7 +2969,11 @@ fn keepalive_keyframe(vid_type: VideoType, resolution: [u32; 2]) -> Option<Arc<V
 
 /// One-shot encode of a black keyframe with gstreamer (openh264enc / x265enc),
 /// returning the first validated keyframe access unit as Annex-B byte-stream bytes.
-fn encode_black_keyframe(vid_type: VideoType, width: u32, height: u32) -> AnyResult<Vec<u8>> {
+pub(super) fn encode_black_keyframe(
+    vid_type: VideoType,
+    width: u32,
+    height: u32,
+) -> AnyResult<Vec<u8>> {
     let (enc, parse, kind) = match vid_type {
         VideoType::H264 => ("openh264enc", "h264parse", "h264"),
         VideoType::H265 => ("x265enc", "h265parse", "h265"),

@@ -2,11 +2,14 @@ use super::*;
 
 use crate::common::UseCounter;
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
-use neolink_core::{bc_protocol::StreamKind, bcmedia::model::BcMedia};
+use neolink_core::{
+    bc_protocol::StreamKind,
+    bcmedia::model::{BcMedia, VideoType},
+};
 use std::{
     collections::HashMap,
     sync::{Arc, LazyLock, Mutex as StdMutex, Weak},
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 use tokio::sync::{broadcast, mpsc::Receiver as MpscReceiver, watch};
 use tokio_util::sync::CancellationToken;
@@ -243,6 +246,38 @@ type HubKey = (String, StreamKind);
 static HUBS: LazyLock<StdMutex<HashMap<HubKey, Weak<StreamHub>>>> =
     LazyLock::new(|| StdMutex::new(HashMap::new()));
 
+/// The most recent complete keyframe seen on a stream, kept after the stream
+/// stops so a still image can be served without waking the camera.
+#[derive(Clone)]
+pub(crate) struct LastKeyframe {
+    pub(crate) video_type: VideoType,
+    pub(crate) data: Arc<Vec<u8>>,
+    pub(crate) at: SystemTime,
+}
+
+static LAST_KEYFRAMES: LazyLock<StdMutex<HashMap<HubKey, LastKeyframe>>> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+/// Last keyframe received for `camera`'s `stream`, if any since start-up.
+pub(crate) fn last_keyframe(camera: &str, stream: StreamKind) -> Option<LastKeyframe> {
+    LAST_KEYFRAMES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(camera.to_string(), stream))
+        .cloned()
+}
+
+/// Viewers currently attached to `camera`'s running `stream` (0 if not running).
+pub(crate) fn stream_viewers(camera: &str, stream: StreamKind) -> usize {
+    HUBS.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(camera.to_string(), stream))
+        .and_then(Weak::upgrade)
+        .filter(|h| !h.stopped.is_cancelled())
+        .map(|h| *h.viewers.borrow())
+        .unwrap_or(0)
+}
+
 /// One running camera-side stream, shared by every viewer of that stream.
 struct StreamHub {
     name: String,
@@ -363,7 +398,18 @@ impl StreamHub {
     /// Store a frame for joiners and send it to every viewer.
     fn publish(&self, media: BcMedia) {
         let mut gop = self.gop.lock().unwrap_or_else(|e| e.into_inner());
-        if matches!(media, BcMedia::Iframe(_)) {
+        if let BcMedia::Iframe(frame) = &media {
+            LAST_KEYFRAMES
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(
+                    (self.name.clone(), self.stream),
+                    LastKeyframe {
+                        video_type: frame.video_type,
+                        data: Arc::new(frame.data.clone()),
+                        at: SystemTime::now(),
+                    },
+                );
             gop.clear();
             gop.push(media.clone());
         } else if !gop.is_empty() {

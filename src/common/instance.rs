@@ -22,6 +22,8 @@ use neolink_core::bc_protocol::BcCamera;
 
 #[cfg(feature = "gstreamer")]
 mod gst;
+#[cfg(feature = "gstreamer")]
+pub(crate) use gst::{last_keyframe, stream_viewers};
 
 /// This instance is the primary interface used throughout the app
 ///
