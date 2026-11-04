@@ -29,7 +29,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    common::{last_keyframe, stream_viewers, NeoReactor},
+    common::{battery, last_keyframe, seed_battery, stream_viewers, BatteryState, NeoReactor},
     config::{CameraConfig, ConnectMode},
     AnyResult,
 };
@@ -62,9 +62,38 @@ pub(super) async fn serve(reactor: NeoReactor, cancel: CancellationToken) -> Any
     };
     log::info!("Status API at http://{addr}/api/status");
     let snapshot_dir = snapshot_dir(config.stream_cache_path.as_deref());
+    if let Some(dir) = snapshot_dir.as_deref() {
+        for cam in config.cameras.iter() {
+            if let Some(state) = load_battery(&battery_file(dir, &cam.name)).await {
+                seed_battery(&cam.name, state);
+            }
+        }
+    }
+    let mut saved: HashMap<String, u64> = HashMap::new();
+    let mut save_tick = tokio::time::interval(Duration::from_secs(30));
     loop {
         tokio::select! {
             _ = cancel.cancelled() => return Ok(()),
+            _ = save_tick.tick() => {
+                if let Some(dir) = snapshot_dir.as_deref() {
+                    let names: Vec<String> = reactor
+                        .config()
+                        .await?
+                        .borrow()
+                        .cameras
+                        .iter()
+                        .map(|c| c.name.clone())
+                        .collect();
+                    for name in names {
+                        if let Some(state) = battery(&name) {
+                            if saved.get(&name) != Some(&state.at) {
+                                save_battery(&battery_file(dir, &name), &state).await;
+                                saved.insert(name, state.at);
+                            }
+                        }
+                    }
+                }
+            }
             accepted = listener.accept() => {
                 let (socket, _) = match accepted {
                     Ok(v) => v,
@@ -194,6 +223,15 @@ async fn camera_status(reactor: &NeoReactor, cam: &CameraConfig) -> serde_json::
         "connected": connected,
         "viewers": viewers,
         "streams": streams,
+        "battery": battery(&cam.name).map(|b| json!({
+            "percent": b.percent,
+            "charging": b.charge_status == "charging",
+            "charge_status": b.charge_status,
+            "adapter": b.adapter_status,
+            "temperature": b.temperature,
+            "low": b.low_power,
+            "updated_at": b.at,
+        })),
     })
 }
 
@@ -274,6 +312,30 @@ async fn snapshot(
         }
     }
     Response::text(404, "no image yet: open the camera once")
+}
+
+fn battery_file(dir: &std::path::Path, name: &str) -> PathBuf {
+    dir.join(format!("{}.battery.json", sanitize(name)))
+}
+
+async fn load_battery(file: &std::path::Path) -> Option<BatteryState> {
+    let bytes = tokio::fs::read(file).await.ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+async fn save_battery(file: &std::path::Path, state: &BatteryState) {
+    let Ok(bytes) = serde_json::to_vec(state) else {
+        return;
+    };
+    if let Some(dir) = file.parent() {
+        if tokio::fs::create_dir_all(dir).await.is_err() {
+            return;
+        }
+    }
+    let tmp = file.with_extension("json.tmp");
+    if tokio::fs::write(&tmp, &bytes).await.is_ok() {
+        let _ = tokio::fs::rename(&tmp, file).await;
+    }
 }
 
 async fn save_snapshot(file: &std::path::Path, bytes: &[u8]) {
@@ -457,6 +519,35 @@ impl Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn battery_survives_a_restart() {
+        let dir = std::env::temp_dir().join(format!("neolink-bat-{}", std::process::id()));
+        let file = battery_file(&dir, "Cam 1");
+        assert!(
+            file.ends_with("Cam_1.battery.json")
+                || file.to_string_lossy().contains(".battery.json")
+        );
+        let state = BatteryState {
+            percent: 87,
+            charge_status: "none".into(),
+            adapter_status: "solarPanel".into(),
+            temperature: 21,
+            low_power: false,
+            at: 1_700_000_000,
+        };
+        save_battery(&file, &state).await;
+        assert_eq!(load_battery(&file).await, Some(state.clone()));
+        seed_battery("api-test-cam", state.clone());
+        let older = BatteryState {
+            percent: 10,
+            at: 1,
+            ..state.clone()
+        };
+        seed_battery("api-test-cam", older);
+        assert_eq!(battery("api-test-cam").map(|b| b.percent), Some(87));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn percent_decoding() {

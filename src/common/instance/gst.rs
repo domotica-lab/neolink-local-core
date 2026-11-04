@@ -267,6 +267,92 @@ pub(crate) fn last_keyframe(camera: &str, stream: StreamKind) -> Option<LastKeyf
         .cloned()
 }
 
+/// Last battery reading of a camera, taken only while it was already awake.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct BatteryState {
+    pub(crate) percent: u32,
+    pub(crate) charge_status: String,
+    pub(crate) adapter_status: String,
+    pub(crate) temperature: i32,
+    pub(crate) low_power: bool,
+    /// Unix seconds of the reading.
+    pub(crate) at: u64,
+}
+
+static BATTERIES: LazyLock<StdMutex<HashMap<String, BatteryState>>> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+/// How often to re-read the battery while a camera stream is running.
+const BATTERY_POLL: Duration = Duration::from_secs(300);
+
+/// Latest known battery state of `camera`, if it was ever read.
+pub(crate) fn battery(camera: &str) -> Option<BatteryState> {
+    BATTERIES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(camera)
+        .cloned()
+}
+
+/// Restore a saved reading (at start-up), unless a newer one is already known.
+pub(crate) fn seed_battery(camera: &str, state: BatteryState) {
+    let mut map = BATTERIES.lock().unwrap_or_else(|e| e.into_inner());
+    if map.get(camera).is_none_or(|cur| cur.at < state.at) {
+        map.insert(camera.to_string(), state);
+    }
+}
+
+fn record_battery(camera: &str, info: &neolink_core::bc::xml::BatteryInfo) {
+    let at = unix_now();
+    let state = BatteryState {
+        percent: info.battery_percent.min(100),
+        charge_status: info.charge_status.clone(),
+        adapter_status: info.adapter_status.clone(),
+        temperature: info.temperature,
+        low_power: info.low_power != 0,
+        at,
+    };
+    log::debug!(
+        "{camera}: battery {}% ({})",
+        state.percent,
+        state.charge_status
+    );
+    seed_battery(camera, state);
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Read the battery now and then while the camera is awake anyway. Readings are
+/// shared by all streams of a camera, so a fresh one is not repeated. Stops at
+/// the first failure (e.g. a mains-powered camera without a battery). Never returns.
+async fn poll_battery(cam: &neolink_core::bc_protocol::BcCamera, name: &str) {
+    loop {
+        let age = battery(name).map(|b| unix_now().saturating_sub(b.at));
+        if let Some(age) = age.filter(|a| *a < BATTERY_POLL.as_secs()) {
+            tokio::time::sleep(Duration::from_secs(BATTERY_POLL.as_secs() - age)).await;
+            continue;
+        }
+        match tokio::time::timeout(Duration::from_secs(10), cam.battery_info()).await {
+            Ok(Ok(info)) => record_battery(name, &info),
+            Ok(Err(e)) => {
+                log::debug!("{name}: no battery reading ({e:?})");
+                break;
+            }
+            Err(_) => {
+                log::debug!("{name}: battery reading timed out");
+                break;
+            }
+        }
+        tokio::time::sleep(BATTERY_POLL).await;
+    }
+    std::future::pending::<()>().await
+}
+
 /// Viewers currently attached to `camera`'s running `stream` (0 if not running).
 pub(crate) fn stream_viewers(camera: &str, stream: StreamKind) -> usize {
     HUBS.lock()
@@ -367,10 +453,16 @@ impl StreamHub {
                 Box::pin(async move {
                     let mut media_stream = cam.start_video(stream, 0, strict).await?;
                     log::trace!("Camera started");
-                    while let Ok(media) = media_stream.get_data().await? {
-                        hub.publish(media);
+                    let media = async {
+                        while let Ok(media) = media_stream.get_data().await? {
+                            hub.publish(media);
+                        }
+                        AnyResult::Ok(())
+                    };
+                    tokio::select! {
+                        r = media => r,
+                        _ = poll_battery(cam, &hub.name) => AnyResult::Ok(()),
                     }
-                    AnyResult::Ok(())
                 })
             }) => v,
             _ = self.wait_unwatched() => {
