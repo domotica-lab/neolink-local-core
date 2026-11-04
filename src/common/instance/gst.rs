@@ -312,7 +312,7 @@ fn record_battery(camera: &str, info: &neolink_core::bc::xml::BatteryInfo) {
         low_power: info.low_power != 0,
         at,
     };
-    log::debug!(
+    log::info!(
         "{camera}: battery {}% ({})",
         state.percent,
         state.charge_status
@@ -340,11 +340,11 @@ async fn poll_battery(cam: &neolink_core::bc_protocol::BcCamera, name: &str) {
         match tokio::time::timeout(Duration::from_secs(10), cam.battery_info()).await {
             Ok(Ok(info)) => record_battery(name, &info),
             Ok(Err(e)) => {
-                log::debug!("{name}: no battery reading ({e:?})");
+                log::info!("{name}: no battery reading ({e})");
                 break;
             }
             Err(_) => {
-                log::debug!("{name}: battery reading timed out");
+                log::info!("{name}: battery reading timed out");
                 break;
             }
         }

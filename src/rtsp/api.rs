@@ -135,7 +135,7 @@ async fn handle(
     let response = if method != "GET" {
         Response::text(405, "only GET is supported")
     } else if path == "/api/status" {
-        Response::json(status(&reactor).await?)
+        Response::json(status(&reactor, snapshot_dir.as_deref()).await?)
     } else if let Some(name) = path
         .strip_prefix("/api/cameras/")
         .and_then(|rest| rest.strip_suffix("/snapshot.jpg"))
@@ -172,11 +172,14 @@ async fn read_head(socket: &mut TcpStream) -> AnyResult<String> {
     Ok(head.lines().next().unwrap_or("").to_string())
 }
 
-async fn status(reactor: &NeoReactor) -> AnyResult<serde_json::Value> {
+async fn status(
+    reactor: &NeoReactor,
+    snapshot_dir: Option<&std::path::Path>,
+) -> AnyResult<serde_json::Value> {
     let config = reactor.config().await?.borrow().clone();
     let mut cameras = Vec::new();
     for cam in config.cameras.iter() {
-        cameras.push(camera_status(reactor, cam).await);
+        cameras.push(camera_status(reactor, cam, snapshot_dir).await);
     }
     Ok(json!({
         "version": env!("NEOLINK_VERSION"),
@@ -185,7 +188,21 @@ async fn status(reactor: &NeoReactor) -> AnyResult<serde_json::Value> {
     }))
 }
 
-async fn camera_status(reactor: &NeoReactor, cam: &CameraConfig) -> serde_json::Value {
+async fn camera_status(
+    reactor: &NeoReactor,
+    cam: &CameraConfig,
+    snapshot_dir: Option<&std::path::Path>,
+) -> serde_json::Value {
+    // After a restart nothing is in memory yet: the saved still image tells
+    // when the camera was last seen.
+    let saved_at = match snapshot_dir {
+        Some(dir) => tokio::fs::metadata(dir.join(format!("{}.jpg", sanitize(&cam.name))))
+            .await
+            .and_then(|m| m.modified())
+            .ok()
+            .map(unix_secs),
+        None => None,
+    };
     let connected = if cam.enabled {
         match reactor.get(&cam.name).await {
             Ok(instance) => instance.camera().borrow().upgrade().is_some(),
@@ -198,14 +215,18 @@ async fn camera_status(reactor: &NeoReactor, cam: &CameraConfig) -> serde_json::
         .stream
         .as_stream_kinds()
         .into_iter()
-        .map(|kind| {
+        .enumerate()
+        .map(|(i, kind)| {
             let viewers = stream_viewers(&cam.name, kind);
+            let last = last_keyframe(&cam.name, kind)
+                .map(|k| unix_secs(k.at))
+                .or(if i == 0 { saved_at } else { None });
             json!({
                 "stream": stream_name(kind),
                 "path": format!("/{}/{}", cam.name, stream_name(kind)),
                 "viewers": viewers,
                 "streaming": viewers > 0,
-                "last_frame_at": last_keyframe(&cam.name, kind).map(|k| unix_secs(k.at)),
+                "last_frame_at": last,
             })
         })
         .collect();
