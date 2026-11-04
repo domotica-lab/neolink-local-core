@@ -19,7 +19,7 @@ struct UnmountGuard<'a> {
 impl Drop for UnmountGuard<'_> {
     fn drop(&mut self) {
         for path in self.paths {
-            log::info!("{}: Unmounting factory from path: {}", self.name, path);
+            log::debug!("{}: Unmounting factory from path: {}", self.name, path);
             self.mounts.remove_factory(path);
         }
     }

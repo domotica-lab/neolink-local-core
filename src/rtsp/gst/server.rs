@@ -71,10 +71,10 @@ impl NeoRtspServer {
         factory.set_auth(Some(&auth));
 
         factory.connect_client_connected(|_, client| {
-            log::info!("RTSP client connected");
+            log::debug!("RTSP client connected");
 
             client.connect_closed(|_| {
-                log::info!("RTSP client disconnected");
+                log::debug!("RTSP client disconnected");
             });
 
             client.connect_new_session(|_, session| {

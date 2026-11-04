@@ -424,7 +424,7 @@ pub(super) async fn make_factory(
             }
             v = async move {
         let name = camera.config().await?.borrow().name.clone();
-        log::info!("{name}::{stream}: Message handler task started, waiting for messages");
+        log::debug!("{name}::{stream}: Message handler task started, waiting for messages");
 
         while let Some(msg) = client_rx.recv().await {
             log::debug!("{name}::{stream}: Received message in handler");
@@ -493,7 +493,7 @@ pub(super) async fn make_factory(
                                 // captured in memory yet), optionally wait briefly for the first
                                 // camera keyframe before replying so go2rtc does not see a
                                 // keepalive-only stream during P2P startup.
-                                log::info!(
+                                log::debug!(
                                     "{name}::{stream}: Using cached stream types: video={:?}, audio={:?}",
                                     cached.vid_type, cached.aud_type
                                 );
@@ -516,7 +516,7 @@ pub(super) async fn make_factory(
                                 let connect = async {
                                     let permit = camera.permit().await?;
                                     let media_rx = camera.stream_while_live(stream).await?;
-                                    log::info!("{name}::{stream}: Camera relay established");
+                                    log::debug!("{name}::{stream}: Camera relay established");
                                     AnyResult::Ok((permit, media_rx))
                                 };
                                 let (permit, media_rx) = tokio::select! {
@@ -618,7 +618,7 @@ pub(super) async fn make_factory(
                                 let connect = async {
                                     let permit = camera.permit().await?;
                                     let media_rx = camera.stream_while_live(stream).await?;
-                                    log::info!("{name}::{stream}: Camera relay established");
+                                    log::debug!("{name}::{stream}: Camera relay established");
                                     let stream_config =
                                         StreamConfig::new(&camera, stream, config.buffer_duration)
                                             .await?;
@@ -745,7 +745,7 @@ pub(super) async fn make_factory(
                         // ---- Keep tokio receiver async; forward into oldest-evicting queue ----
                         let queue_capacity = media_queue_capacity(&stream_config);
                         let stream_label = format!("{name}::{stream}");
-                        log::info!(
+                        log::debug!(
                             "{stream_label}: Media queue capacity set to {}",
                             queue_capacity
                         );
@@ -944,7 +944,7 @@ pub(super) async fn make_factory(
                             } else {
                                 Duration::from_millis(150)
                             };
-                            log::info!(
+                            log::debug!(
                                 "{stream_label}: Backpressure thresholds: fill>{:.2}, lag_enter={:?}, lag_exit={:?}",
                                 backpressure_threshold,
                                 lag_enter_threshold,
@@ -1626,7 +1626,7 @@ pub(super) async fn make_factory(
                                 }
                             }
 
-                            log::info!("{stream_label}: Camera relay disconnected");
+                            log::debug!("{stream_label}: Camera relay disconnected");
                             AnyResult::Ok(())
                         });
                         AnyResult::Ok(())
