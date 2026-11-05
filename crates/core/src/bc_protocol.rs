@@ -45,6 +45,7 @@ mod version;
 
 pub use connection::DEFAULT_GAP_SKIP_WAIT_MS;
 pub(crate) use connection::*;
+pub use connection::{last_local_address, remember_local_address};
 pub use credentials::*;
 pub use errors::Error;
 pub use ledstate::LightState;

@@ -113,6 +113,31 @@ lazy_static! {
         RwLock::new(HashMap::new());
 }
 
+lazy_static! {
+    /// IP each camera answered local discovery from last time. A sleeping
+    /// camera can take seconds to notice a broadcast, so it is also asked
+    /// directly at this address.
+    static ref LAST_LOCAL_IP: std::sync::Mutex<HashMap<String, std::net::IpAddr>> =
+        std::sync::Mutex::new(HashMap::new());
+}
+
+/// Address `uid` answered local discovery from last time, if known.
+pub fn last_local_address(uid: &str) -> Option<std::net::IpAddr> {
+    LAST_LOCAL_IP
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(uid)
+        .copied()
+}
+
+/// Remember (or restore after a restart) where `uid` answered local discovery.
+pub fn remember_local_address(uid: &str, ip: std::net::IpAddr) {
+    LAST_LOCAL_IP
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(uid.to_string(), ip);
+}
+
 fn relay_hostname_for_region(region: &str) -> Option<&'static str> {
     match region.trim().to_ascii_lowercase().as_str() {
         "north america (east us)" => Some("p2p1.reolink.com"),
@@ -1289,11 +1314,21 @@ impl Discovery {
         uid: &str,
         mut optional_addrs: Option<Vec<SocketAddr>>,
     ) -> Result<DiscoveryResult> {
-        let mut dests = get_broadcasts(&[2015, 2018])?;
+        let started = Instant::now();
+        let mut dests = vec![];
+        if let Some(ip) = last_local_address(uid) {
+            info!("Local discovery: also asking {uid} directly at its last address {ip}");
+            dests.push(SocketAddr::new(ip, 2018));
+            dests.push(SocketAddr::new(ip, 2015));
+        }
+        let unicast: HashSet<SocketAddr> = dests.iter().copied().collect();
+        dests.append(&mut get_broadcasts(&[2015, 2018])?);
         if let Some(mut optional_addrs) = optional_addrs.take() {
             debug!("Also sending to {:?}", optional_addrs);
             dests.append(&mut optional_addrs);
         }
+        let mut seen = HashSet::new();
+        dests.retain(|d| seen.insert(*d));
         let discoverer_ref = &self.discoverer;
         let client_id = self.client_id;
         let mut futures = FuturesUnordered::new();
@@ -1302,13 +1337,24 @@ impl Discovery {
                 discoverer_ref
                     .client_initiated_direct(uid, client_id, addr)
                     .await
+                    .map(|r| (r, addr))
             })
         }
 
         let connect_result;
         loop {
             match futures.next().await {
-                Some(Ok(good_result)) => {
+                Some(Ok((good_result, dest))) => {
+                    info!(
+                        "Local discovery: {uid} answered in {} ms ({})",
+                        started.elapsed().as_millis(),
+                        if unicast.contains(&dest) {
+                            "asked at its last address"
+                        } else {
+                            "found by broadcast"
+                        }
+                    );
+                    remember_local_address(uid, good_result.addr.ip());
                     connect_result = good_result;
                     break;
                 }

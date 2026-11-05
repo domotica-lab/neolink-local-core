@@ -104,6 +104,7 @@ impl AddressOrUid {
 pub(crate) async fn connect_and_login(camera_config: &CameraConfig) -> Result<BcCamera> {
     let camera_addr =
         AddressOrUid::new(&camera_config.camera_addr, &camera_config.camera_uid).unwrap();
+    let started = std::time::Instant::now();
     info!(
         "{}: Connecting to camera at {}",
         camera_config.name, camera_addr
@@ -151,12 +152,19 @@ pub(crate) async fn connect_and_login(camera_config: &CameraConfig) -> Result<Bc
         "aes" => MaxEncryption::Aes,
         _ => MaxEncryption::Aes,
     };
+    let found_after = started.elapsed();
     info!("{}: Logging in", camera_config.name);
     timeout(camera.login_with_maxenc(max_encryption))
         .await
         .with_context(|| format!("Failed to login to {}", camera_config.name))??;
 
-    info!("{}: Connected and logged in", camera_config.name);
+    info!(
+        "{}: Connected and logged in ({:.1}s: found in {:.1}s, login {:.1}s)",
+        camera_config.name,
+        started.elapsed().as_secs_f32(),
+        found_after.as_secs_f32(),
+        (started.elapsed() - found_after).as_secs_f32()
+    );
 
     Ok(camera)
 }

@@ -20,7 +20,10 @@ use std::{
 use anyhow::{anyhow, Context};
 use gstreamer::{prelude::*, ClockTime};
 use gstreamer_app::{AppSink, AppSrc};
-use neolink_core::{bc_protocol::StreamKind, bcmedia::model::VideoType};
+use neolink_core::{
+    bc_protocol::{last_local_address, remember_local_address, StreamKind},
+    bcmedia::model::VideoType,
+};
 use serde_json::json;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -62,11 +65,16 @@ pub(super) async fn serve(reactor: NeoReactor, cancel: CancellationToken) -> Any
     };
     log::info!("Status API at http://{addr}/api/status");
     let snapshot_dir = snapshot_dir(config.stream_cache_path.as_deref());
+    let mut saved_addrs: HashMap<String, std::net::IpAddr> = HashMap::new();
     if let Some(dir) = snapshot_dir.as_deref() {
         for cam in config.cameras.iter() {
             if let Some(state) = load_battery(&battery_file(dir, &cam.name)).await {
                 seed_battery(&cam.name, state);
             }
+        }
+        saved_addrs = load_addresses(dir).await;
+        for (uid, ip) in saved_addrs.iter() {
+            remember_local_address(uid, *ip);
         }
     }
     let mut saved: HashMap<String, u64> = HashMap::new();
@@ -76,14 +84,23 @@ pub(super) async fn serve(reactor: NeoReactor, cancel: CancellationToken) -> Any
             _ = cancel.cancelled() => return Ok(()),
             _ = save_tick.tick() => {
                 if let Some(dir) = snapshot_dir.as_deref() {
-                    let names: Vec<String> = reactor
+                    let (names, uids): (Vec<String>, Vec<Option<String>>) = reactor
                         .config()
                         .await?
                         .borrow()
                         .cameras
                         .iter()
-                        .map(|c| c.name.clone())
+                        .map(|c| (c.name.clone(), c.camera_uid.clone()))
+                        .unzip();
+                    let addrs: HashMap<String, std::net::IpAddr> = uids
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|uid| last_local_address(&uid).map(|ip| (uid, ip)))
                         .collect();
+                    if !addrs.is_empty() && addrs != saved_addrs {
+                        save_addresses(dir, &addrs).await;
+                        saved_addrs = addrs;
+                    }
                     for name in names {
                         if let Some(state) = battery(&name) {
                             if saved.get(&name) != Some(&state.at) {
@@ -335,6 +352,33 @@ async fn snapshot(
     Response::text(404, "no image yet: open the camera once")
 }
 
+/// Where each camera answered local discovery, so the first wake after a
+/// restart can ask it directly too.
+fn addresses_file(dir: &std::path::Path) -> PathBuf {
+    dir.join("addresses.json")
+}
+
+async fn load_addresses(dir: &std::path::Path) -> HashMap<String, std::net::IpAddr> {
+    match tokio::fs::read(addresses_file(dir)).await {
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
+        Err(_) => HashMap::new(),
+    }
+}
+
+async fn save_addresses(dir: &std::path::Path, addrs: &HashMap<String, std::net::IpAddr>) {
+    let Ok(bytes) = serde_json::to_vec(addrs) else {
+        return;
+    };
+    if tokio::fs::create_dir_all(dir).await.is_err() {
+        return;
+    }
+    let file = addresses_file(dir);
+    let tmp = file.with_extension("json.tmp");
+    if tokio::fs::write(&tmp, &bytes).await.is_ok() {
+        let _ = tokio::fs::rename(&tmp, &file).await;
+    }
+}
+
 fn battery_file(dir: &std::path::Path, name: &str) -> PathBuf {
     dir.join(format!("{}.battery.json", sanitize(name)))
 }
@@ -540,6 +584,20 @@ impl Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn camera_addresses_survive_a_restart() {
+        let dir = std::env::temp_dir().join(format!("neolink-addr-{}", std::process::id()));
+        assert!(load_addresses(&dir).await.is_empty());
+        let mut addrs = HashMap::new();
+        addrs.insert(
+            "95270000XXXXXXXX".to_string(),
+            "192.168.1.61".parse().unwrap(),
+        );
+        save_addresses(&dir, &addrs).await;
+        assert_eq!(load_addresses(&dir).await, addrs);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[tokio::test]
     async fn battery_survives_a_restart() {

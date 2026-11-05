@@ -20,6 +20,7 @@ pub(crate) use self::{
 };
 // Publicly re-exported (via bc_protocol) so the binary can show the effective
 // default in its connection-config log.
+pub use self::discovery::{last_local_address, remember_local_address};
 pub use self::udpsource::DEFAULT_GAP_SKIP_WAIT_MS;
 
 pub(crate) struct DiscoveryResult {
