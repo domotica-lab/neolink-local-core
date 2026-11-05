@@ -64,6 +64,8 @@ LABEL description="An image for the neolink program which is a reolink camera to
 LABEL repository="$REPO"
 LABEL version="$VERSION"
 LABEL maintainer="$OWNER"
+LABEL org.opencontainers.image.source="https://github.com/$REPO"
+LABEL org.opencontainers.image.licenses="AGPL-3.0"
 
 # hadolint ignore=DL3008
 RUN apt-get update && \

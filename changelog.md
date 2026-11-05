@@ -10,6 +10,28 @@ Format loosely based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## 1.0.4 (Neolink Local)
+
+First release of this fork as **Neolink Local** (`domotica-lab/neolink-local-core`),
+based on 0.7.19.
+
+- **Battery fix:** an `on_demand` camera always disconnects after the last viewer
+  leaves, even when the player reconnected during the keepalive phase (the old
+  code could leak a permit and keep the camera connected forever).
+- **Shared stream hub:** one camera-side stream per camera and stream kind,
+  shared by every RTSP client, with replay from the last keyframe for joiners.
+  Closing one client no longer stops the others' video.
+- **Clean shutdown** on SIGTERM in about 1.5 s.
+- **Status API** (`api_port`, default 8559, `api_bind` default 127.0.0.1):
+  `/api/status` and `/api/cameras/<name>/snapshot.jpg`, plus the last battery
+  reading (taken only while the camera is already awake), persisted across
+  restarts.
+- **Faster local discovery:** the camera is also asked at the IP it answered
+  from last time (persisted across restarts).
+- Quieter logs; per-phase connection timings; battery readings logged.
+- Docker image `ghcr.io/<owner>/neolink-local:<VERSION>`, built on every push
+  to `main` from the `VERSION` file.
+
 ## 0.7.19
 
 Cleaner Home Assistant MQTT entity names, a debug-only GOP diagnostic, and a docs
