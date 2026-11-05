@@ -27,6 +27,7 @@ RUN apt-get update && \
 
 FROM build-base AS build
 ARG TARGETPLATFORM
+ARG VERSION
 
 WORKDIR /usr/local/src/neolink
 COPY . /usr/local/src/neolink
@@ -48,6 +49,7 @@ RUN  echo "TARGETPLATFORM: ${TARGETPLATFORM}"; \
     cp "${TARGETPLATFORM}/neolink" "/usr/local/src/neolink/target/release/neolink"; \
   else \
     echo "Building from scratch"; \
+    if [ -n "${VERSION}" ]; then export GITHUB_SHA="${VERSION}"; fi; \
     cargo build --release; \
   fi
 

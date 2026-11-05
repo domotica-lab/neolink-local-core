@@ -5,7 +5,7 @@ on:
       - '*'
 
 env:
-  REGISTRY_IMAGE: ghcr.io/${{ github.repository_owner }}/neolink
+  REGISTRY_IMAGE: ghcr.io/${{ github.repository_owner }}/neolink-local
 
 jobs:
   # Build each architecture natively on its own runner and push by digest.
@@ -49,6 +49,10 @@ jobs:
         with:
           context: .
           platforms: ${{ matrix.platform }}
+          build-args: |
+            VERSION=${{ github.ref_name }}
+            REPO=${{ github.repository }}
+            OWNER=${{ github.repository_owner }}
           outputs: type=image,name=${{ env.REGISTRY_IMAGE }},push-by-digest=true,name-canonical=true,push=true
 
       - name: Export digest

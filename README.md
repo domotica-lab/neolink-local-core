@@ -1,4 +1,31 @@
-# Neolink
+# Neolink Local (core)
+
+> **Unofficial fork.** This is the source of the *Neolink Local* Home Assistant
+> add-on ([domotica-lab/neolink-local](https://github.com/domotica-lab/neolink-local)).
+> It is based on [privatecoder/neolink](https://github.com/privatecoder/neolink)
+> (itself from QuantumEntangledAndy and thirtythreeforty) and is not affiliated
+> with its authors or with Reolink. Licensed under AGPL-3.0 like the original.
+>
+> Changes in this fork:
+>
+> - on_demand (battery) cameras always disconnect after the last viewer closes,
+>   even if the player reconnected while the camera was waking up;
+> - one shared camera stream per camera and stream type, with replay from the
+>   last keyframe for players that join or reconnect;
+> - clean shutdown on SIGTERM (about 1.5 s);
+> - local status API (`api_port`, default 8559 on 127.0.0.1): camera state,
+>   viewers, last-seen still image and last battery reading, none of which wake
+>   a camera;
+> - faster local discovery: a camera is also asked directly at the IP it answered
+>   from last time;
+> - quieter logs and per-phase connection timings.
+>
+> Images: `ghcr.io/domotica-lab/neolink-local:<version>` (amd64, arm64), built
+> by pushing a tag.
+
+---
+
+## Original README
 
 [![dependency status](https://deps.rs/repo/github/privatecoder/neolink/status.svg)](https://deps.rs/repo/github/privatecoder/neolink)
 
