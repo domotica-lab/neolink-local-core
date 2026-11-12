@@ -286,7 +286,10 @@ struct UdpPayloadInner {
     packets_sent: u32,
     packets_want: u32,
     sent: BTreeMap<u32, UdpData>,
-    recieved: BTreeMap<u32, Vec<u8>>,
+    /// Out-of-order packets waiting for the gap before them to be filled,
+    /// with the instant each one arrived (used to time the gap, see
+    /// [`gap_to_skip`]).
+    recieved: BTreeMap<u32, (Vec<u8>, Instant)>,
     last_delivery_at: Instant,
     gap_skip_wait: Duration,
     // --- debug transport stats (1/sec heartbeat) ---
@@ -592,7 +595,9 @@ impl UdpPayloadInner {
                                             self.stat_max_reorder_depth = depth;
                                         }
                                     }
-                                    self.recieved.insert(packet_id, data.payload);
+                                    self.recieved
+                                        .entry(packet_id)
+                                        .or_insert_with(|| (data.payload, Instant::now()));
                                     if self.recieved.len() as u32 > self.stat_max_pending {
                                         self.stat_max_pending = self.recieved.len() as u32;
                                     }
@@ -607,30 +612,28 @@ impl UdpPayloadInner {
             },
         }?;
         log::trace!("Send");
-        if !self.recieved.is_empty() {
-            let wait = self.last_delivery_at.elapsed();
-            if wait >= self.gap_skip_wait {
-                if let Some(&next_id) = self.recieved.keys().next() {
-                    if next_id > self.packets_want {
-                        let last_id = self.recieved.keys().max().copied().unwrap_or(next_id);
-                        let gap_len = next_id.saturating_sub(self.packets_want);
-                        log::warn!(
-                            "UDP payload gap from {}: skipping missing packets {}..{} (gap={}, wait={:?}, pending={}, max_id={})",
-                            self.camera_addr,
-                            self.packets_want,
-                            next_id.saturating_sub(1),
-                            gap_len,
-                            wait,
-                            self.recieved.len(),
-                            last_id,
-                        );
-                        self.packets_want = next_id;
-                        self.ack_tx.send_replace(self.build_send_ack());
-                    }
-                }
-            }
+        if let Some((next_id, wait)) = gap_to_skip(
+            self.packets_want,
+            &self.recieved,
+            Instant::now(),
+            self.gap_skip_wait,
+        ) {
+            let last_id = self.recieved.keys().max().copied().unwrap_or(next_id);
+            let gap_len = next_id.saturating_sub(self.packets_want);
+            log::warn!(
+                "UDP payload gap from {}: skipping missing packets {}..{} (gap={}, wait={:?}, pending={}, max_id={})",
+                self.camera_addr,
+                self.packets_want,
+                next_id.saturating_sub(1),
+                gap_len,
+                wait,
+                self.recieved.len(),
+                last_id,
+            );
+            self.packets_want = next_id;
+            self.ack_tx.send_replace(self.build_send_ack());
         }
-        while let Some(payload) = self.recieved.remove(&self.packets_want) {
+        while let Some((payload, _)) = self.recieved.remove(&self.packets_want) {
             log::trace!("  + {}", self.packets_want);
             self.packets_want += 1;
             self.stat_delivered += 1;
@@ -895,6 +898,31 @@ impl futures::AsyncWrite for UdpPayloadSource {
     }
 }
 
+/// Decide whether the reassembler should give up on the gap blocking delivery.
+///
+/// Returns `Some((next_id, waited))` when the packets before `next_id` should be
+/// skipped. The gap is timed from when it was first *observed* — the arrival of
+/// the earliest pending packet, since every pending packet lies beyond the
+/// missing one — not from the last delivery. Timing from the last delivery made
+/// a gap that appears after a quiet period (or after a previous skip) look
+/// already "old", so it was skipped the instant it was seen, before the camera
+/// had any chance to retransmit (`wait=3.2s, pending=1` in the logs). Every
+/// such skip corrupts video until the next keyframe.
+fn gap_to_skip<T>(
+    packets_want: u32,
+    recieved: &BTreeMap<u32, (T, Instant)>,
+    now: Instant,
+    gap_skip_wait: Duration,
+) -> Option<(u32, Duration)> {
+    let (&next_id, _) = recieved.iter().next()?;
+    if next_id <= packets_want {
+        return None;
+    }
+    let detected_at = recieved.values().map(|(_, at)| *at).min()?;
+    let waited = now.saturating_duration_since(detected_at);
+    (waited >= gap_skip_wait).then_some((next_id, waited))
+}
+
 fn set_udp_buffer_sizes(socket: &std::net::UdpSocket, size: usize) {
     let sock_ref = SockRef::from(socket);
     if let Err(e) = sock_ref.set_recv_buffer_size(size) {
@@ -935,4 +963,48 @@ async fn connect_try_port(port: u16) -> Result<UdpSocket> {
     set_udp_buffer_sizes(&std_socket, UDP_BUFFER_SIZE);
 
     Ok(UdpSocket::from_std(std_socket)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const WAIT: Duration = Duration::from_millis(500);
+
+    #[test]
+    fn no_skip_without_gap() {
+        let t0 = Instant::now();
+        let mut r = BTreeMap::new();
+        assert_eq!(gap_to_skip(5, &r, t0 + WAIT * 10, WAIT), None);
+        r.insert(5u32, ((), t0));
+        assert_eq!(gap_to_skip(5, &r, t0 + WAIT * 10, WAIT), None);
+    }
+
+    #[test]
+    fn fresh_gap_is_not_skipped_even_after_long_idle() {
+        // Regression: the gap used to be timed from the last delivery, so the
+        // first out-of-order packet after a quiet period skipped instantly.
+        let t0 = Instant::now();
+        let mut r = BTreeMap::new();
+        r.insert(518u32, ((), t0));
+        assert_eq!(
+            gap_to_skip(510, &r, t0 + Duration::from_millis(1), WAIT),
+            None
+        );
+        assert_eq!(gap_to_skip(510, &r, t0 + WAIT, WAIT), Some((518, WAIT)));
+    }
+
+    #[test]
+    fn gap_is_timed_from_earliest_pending_arrival() {
+        let t0 = Instant::now();
+        let mut r = BTreeMap::new();
+        r.insert(12u32, ((), t0 + Duration::from_millis(300)));
+        r.insert(15u32, ((), t0)); // arrived first: gap observed at t0
+        let now = t0 + WAIT;
+        assert_eq!(gap_to_skip(10, &r, now, WAIT), Some((12, WAIT)));
+        assert_eq!(
+            gap_to_skip(10, &r, now - Duration::from_millis(1), WAIT),
+            None
+        );
+    }
 }

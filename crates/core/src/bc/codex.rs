@@ -12,8 +12,11 @@ use tokio_util::codec::{Decoder, Encoder};
 /// Maximum number of bytes the resync may skip (cumulatively, across decode
 /// calls) without a clean decode before the error is surfaced as fatal. Tolerates
 /// UDP holes while preventing a genuinely broken stream from being scanned
-/// forever.
-const MAX_RESYNC_BYTES: usize = 64 * 1024;
+/// forever. Must comfortably exceed a main-stream I-frame burst (~240 KB, see
+/// `docs/media-streams.md`): a hole early in a keyframe can leave the resync
+/// scanning through the rest of it, and the old 64 KB budget turned that into a
+/// fatal `Magic invalid` + reconnect.
+const MAX_RESYNC_BYTES: usize = 1024 * 1024;
 
 pub(crate) struct BcCodex {
     context: BcContext,

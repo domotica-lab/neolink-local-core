@@ -10,6 +10,19 @@ Format loosely based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## Unreleased
+
+- **Fewer corrupted (smeared grey/purple) frames on lossy Wi-Fi.** The UDP
+  reassembler timed a missing packet from the *last delivery* instead of from
+  when the gap was first seen, so a gap appearing after a quiet moment (or right
+  after a previous skip) was skipped instantly — before the camera could
+  retransmit it (`wait=3.2s, pending=1` in the logs). Gaps are now timed from the
+  arrival of the first packet beyond them, so every gap gets the full
+  `udp_gap_skip_ms` window.
+- **No reconnect on `Magic invalid` after a loss inside a keyframe.** The BC
+  control-codec resync budget was 64 KB, smaller than one main-stream I-frame
+  burst (~240 KB); it is now 1 MB.
+
 ## 1.0.4 (Neolink Local)
 
 First release of this fork as **Neolink Local** (`domotica-lab/neolink-local-core`),
