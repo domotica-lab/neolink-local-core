@@ -10,7 +10,7 @@ Format loosely based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
-## Unreleased
+## 1.0.5 (Neolink Local)
 
 - **Fewer corrupted (smeared grey/purple) frames on lossy Wi-Fi.** The UDP
   reassembler timed a missing packet from the *last delivery* instead of from
