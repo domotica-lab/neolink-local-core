@@ -10,6 +10,16 @@ Format loosely based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## 1.0.6 (Neolink Local)
+
+- **No more lost video (and `header.msg_id: 3` log floods) when a stream's first
+  packet is dropped.** A video stream is switched to binary mode only by its first
+  reply (`binaryData=1`). If that one message fell into a UDP gap and was skipped,
+  every following frame was parsed as XML, failed, was discarded by the resync and
+  dumped to the log, until the resync budget ran out and the camera reconnected.
+  Non-XML video payloads are now recognised as media and binary mode is latched
+  for the stream, so it recovers at the next keyframe.
+
 ## 1.0.5 (Neolink Local)
 
 - **Fewer corrupted (smeared grey/purple) frames on lossy Wi-Fi.** The UDP
