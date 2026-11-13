@@ -226,6 +226,27 @@ impl Decoder for BcCodex {
             }
         }
 
+        // The stream's first reply (the one carrying `binaryData=1`) was lost, so
+        // binary mode was never switched on; `bc::de` recognised this video frame
+        // as binary anyway. Latch binary mode now so later frames take the normal
+        // binary path instead of an XML parse attempt each time.
+        if bc.meta.msg_id == MSG_ID_VIDEO
+            && !self.context.in_bin_mode.contains(&bc.meta.msg_num)
+            && matches!(
+                bc.body,
+                BcBody::ModernMsg(ModernMsg {
+                    payload: Some(BcPayloads::Binary(_)),
+                    ..
+                })
+            )
+        {
+            log::debug!(
+                "Video stream {} entered binary mode without its start reply (lost packet); recovered",
+                bc.meta.msg_num
+            );
+            self.context.binary_on(bc.meta.msg_num);
+        }
+
         Ok(Some(bc))
     }
 }
@@ -239,6 +260,23 @@ mod tests {
             context: BcContext::new_with_encryption(EncryptionProtocol::BCEncrypt),
             amount_skipped: 0,
         }
+    }
+
+    #[test]
+    fn video_binary_mode_latched_when_start_reply_lost() {
+        let sample2 = include_bytes!("samples/modern_video_start2.bin");
+        let mut codex = bcencrypt_codex();
+        let mut buf = BytesMut::from(&sample2[..]);
+        let bc = codex.decode(&mut buf).unwrap().unwrap();
+        assert!(matches!(
+            bc.body,
+            BcBody::ModernMsg(ModernMsg {
+                payload: Some(BcPayloads::Binary(_)),
+                ..
+            })
+        ));
+        assert!(codex.context.in_bin_mode.contains(&bc.meta.msg_num));
+        assert_eq!(codex.amount_skipped, 0);
     }
 
     #[test]

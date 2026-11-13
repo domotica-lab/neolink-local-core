@@ -223,21 +223,34 @@ fn bc_modern_msg<'a>(
                         .unwrap_or("Not Text".to_string())
                 );
             }
-            let xml = BcXml::try_parse(processed_payload_buf.as_slice()).map_err(|e| {
-                error!("header.msg_id: {}", header.msg_id);
-                error!(
-                    "processed_payload_buf: {:X?}::{:?}",
-                    processed_payload_buf,
-                    std::str::from_utf8(&processed_payload_buf)
-                );
-                log::error!("e: {:?}", e);
-                Err::Error(make_error(
-                    buf,
-                    "Unable to parse Payload XML",
-                    ErrorKind::MapRes,
-                ))
-            })?;
-            payload = Some(BcPayloads::BcXml(xml));
+            match BcXml::try_parse(processed_payload_buf.as_slice()) {
+                Ok(xml) => payload = Some(BcPayloads::BcXml(xml)),
+                // A video stream is switched to binary mode by its *first* reply
+                // (extension `binaryData=1`). If that one message is lost on a
+                // lossy UDP link (`udp_gap_skip_ms` skip), `in_bin_mode` is never
+                // set for this `msg_num` and every following frame would fail the
+                // XML parse, be discarded by the resync, and spam the log until
+                // the connection is torn down. Video payloads that are not XML can
+                // only be media, so treat them as binary; `BcCodex` then latches
+                // binary mode for the stream.
+                Err(_) if header.msg_id == MSG_ID_VIDEO => {
+                    payload = Some(BcPayloads::Binary(payload_buf.to_vec()));
+                }
+                Err(e) => {
+                    error!("header.msg_id: {}", header.msg_id);
+                    error!(
+                        "processed_payload_buf: {:X?}::{:?}",
+                        processed_payload_buf,
+                        std::str::from_utf8(&processed_payload_buf)
+                    );
+                    error!("e: {:?}", e);
+                    return Err(Err::Error(make_error(
+                        buf,
+                        "Unable to parse Payload XML",
+                        ErrorKind::MapRes,
+                    )));
+                }
+            }
         }
     } else {
         payload = None;
@@ -469,6 +482,30 @@ mod tests {
 
         context.in_bin_mode.insert(msg1.meta.msg_num);
         let msg2 = Bc::deserialize(&context, &mut BytesMut::from(&sample2[..])).unwrap();
+        match msg2.body {
+            BcBody::ModernMsg(ModernMsg {
+                extension: None,
+                payload: Some(BcPayloads::Binary(bin)),
+            }) => {
+                assert_eq!(bin.len(), 30344);
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    // If the stream's first reply (the one that switches on binary mode) is lost on
+    // a lossy UDP link, the following video frames must still decode as binary
+    // instead of failing an XML parse on every frame.
+    fn test_bc_binary_mode_first_reply_lost() {
+        init();
+
+        let sample2 = include_bytes!("samples/modern_video_start2.bin");
+
+        // Fresh context: binary mode was never enabled for this msg_num.
+        let context = BcContext::new_with_encryption(EncryptionProtocol::BCEncrypt);
+        let msg2 = Bc::deserialize(&context, &mut BytesMut::from(&sample2[..])).unwrap();
+        assert_eq!(msg2.meta.msg_id, MSG_ID_VIDEO);
         match msg2.body {
             BcBody::ModernMsg(ModernMsg {
                 extension: None,
