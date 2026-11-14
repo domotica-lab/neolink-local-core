@@ -227,6 +227,17 @@ Reading the heartbeat:
   that a retransmit (NAKed via the selective-ACK bitmap on every received packet) has
   several round-trips to land before a skip is attempted.
 
+  **Adaptive:** the camera resends a missing packet on its own timer rather
+  than immediately on the selective-ACK NAK, so on a lossy link the retransmit
+  often lands just after a fixed 500 ms deadline and was silently dropped while
+  the skip had already corrupted the frame. `GapWait` (`udpsource.rs`)
+  remembers skipped ids for 5 s; when one arrives late it raises the effective
+  wait to that delay + 150 ms (cap 2000 ms), remembered per camera IP across
+  reconnects. It only grows from observed late retransmits and decays by 100 ms
+  per minute without them, never below the configured value. Once a minute an
+  `info` line `UDP loss from <ip>: last minute skipped N packet(s); M
+  retransmit(s) arrived after their skip …` summarises it.
+
   A skip punches a hole in the reassembled byte stream, which desyncs the BC framing
   for one message. Both the control codec (`BcCodex`) and the media codec
   (`BcMediaCodex`) recover by scanning forward to the next BC header magic and

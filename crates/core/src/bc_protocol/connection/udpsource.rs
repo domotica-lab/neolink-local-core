@@ -291,7 +291,9 @@ struct UdpPayloadInner {
     /// [`gap_to_skip`]).
     recieved: BTreeMap<u32, (Vec<u8>, Instant)>,
     last_delivery_at: Instant,
-    gap_skip_wait: Duration,
+    /// Learns how late the camera's retransmits arrive and stretches the gap
+    /// wait to match (see [`GapWait`]).
+    gap_wait: GapWait,
     // --- debug transport stats (1/sec heartbeat) ---
     stat_last_report: Instant,
     stat_pkts_in: u64,
@@ -489,7 +491,16 @@ impl UdpPayloadInner {
             }
         });
 
-        log::info!("UDP gap skip wait set to {}ms", gap_skip_wait.as_millis());
+        let gap_wait = GapWait::new(gap_skip_wait, camera_addr.ip());
+        if gap_wait.current() > gap_skip_wait {
+            log::info!(
+                "UDP gap skip wait set to {}ms (configured {}ms, learned from earlier late retransmits)",
+                gap_wait.current().as_millis(),
+                gap_skip_wait.as_millis()
+            );
+        } else {
+            log::info!("UDP gap skip wait set to {}ms", gap_skip_wait.as_millis());
+        }
 
         Self {
             camera_addr,
@@ -505,7 +516,7 @@ impl UdpPayloadInner {
             sent: Default::default(),
             recieved: Default::default(),
             last_delivery_at: Instant::now(),
-            gap_skip_wait,
+            gap_wait,
             stat_last_report: Instant::now(),
             stat_pkts_in: 0,
             stat_bytes_in: 0,
@@ -602,6 +613,18 @@ impl UdpPayloadInner {
                                         self.stat_max_pending = self.recieved.len() as u32;
                                     }
                                     self.ack_tx.send_replace(self.build_send_ack());
+                                } else if let Some(late) = self.gap_wait.on_late(packet_id, Instant::now()) {
+                                    // A retransmit of a packet we already skipped:
+                                    // too late to use, but it tells us how long the
+                                    // camera takes to resend.
+                                    if let Some(new_wait) = late.raised_to {
+                                        log::info!(
+                                            "UDP retransmit from {} arrived {:?} after its gap; now waiting up to {}ms before skipping",
+                                            self.camera_addr,
+                                            late.after_gap,
+                                            new_wait.as_millis()
+                                        );
+                                    }
                                 }
                             }
                         },
@@ -616,7 +639,7 @@ impl UdpPayloadInner {
             self.packets_want,
             &self.recieved,
             Instant::now(),
-            self.gap_skip_wait,
+            self.gap_wait.current(),
         ) {
             let last_id = self.recieved.keys().max().copied().unwrap_or(next_id);
             let gap_len = next_id.saturating_sub(self.packets_want);
@@ -630,6 +653,8 @@ impl UdpPayloadInner {
                 self.recieved.len(),
                 last_id,
             );
+            self.gap_wait
+                .on_skip(self.packets_want, next_id, Instant::now(), wait);
             self.packets_want = next_id;
             self.ack_tx.send_replace(self.build_send_ack());
         }
@@ -639,6 +664,9 @@ impl UdpPayloadInner {
             self.stat_delivered += 1;
             self.thread_stream.feed(Ok(payload)).await?;
             self.last_delivery_at = Instant::now();
+        }
+        if let Some(summary) = self.gap_wait.minute_summary(Instant::now()) {
+            log::info!("UDP loss from {}: {}", self.camera_addr, summary);
         }
         if self.stat_last_report.elapsed() >= Duration::from_secs(1) {
             let win = self.stat_last_report.elapsed();
@@ -923,6 +951,157 @@ fn gap_to_skip<T>(
     (waited >= gap_skip_wait).then_some((next_id, waited))
 }
 
+/// Adaptive wait before skipping a UDP gap.
+///
+/// The camera does not resend a missing packet as soon as the selective-ACK
+/// reports it; it resends on its own timer, so on a lossy link a retransmit
+/// often lands just *after* the fixed `udp_gap_skip_ms` deadline and is thrown
+/// away, while the skip has already corrupted the picture. `GapWait` remembers
+/// recently skipped packet ids; when one of them arrives late it measures how
+/// long after the gap it came and raises the wait to cover that (plus a
+/// margin, capped at [`GapWait::MAX`]). Without late retransmits the wait never
+/// grows, and it decays back to the configured value when they stop.
+/// Gap wait learned per camera IP, kept across reconnects (on-demand cameras
+/// reconnect often and would otherwise relearn it every time).
+static LEARNED_GAP_WAIT: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, Duration>>,
+> = std::sync::LazyLock::new(Default::default);
+
+struct GapWait {
+    camera_ip: Option<std::net::IpAddr>,
+    configured: Duration,
+    current: Duration,
+    /// Skipped packet id -> (when the gap was first seen).
+    skipped: BTreeMap<u32, Instant>,
+    // per-minute summary
+    window_start: Instant,
+    win_skipped: u64,
+    win_late: u64,
+    win_max_late: Duration,
+}
+
+struct LateRetransmit {
+    /// Time from when the gap was first seen to the retransmit's arrival.
+    after_gap: Duration,
+    /// The new wait, if this arrival raised it.
+    raised_to: Option<Duration>,
+}
+
+impl GapWait {
+    const MAX: Duration = Duration::from_millis(2000);
+    const MARGIN: Duration = Duration::from_millis(150);
+    const DECAY: Duration = Duration::from_millis(100);
+    const SUMMARY_EVERY: Duration = Duration::from_secs(60);
+    /// Forget skipped ids after this long (a retransmit later than this is useless).
+    const REMEMBER: Duration = Duration::from_secs(5);
+
+    fn new(configured: Duration, camera_ip: std::net::IpAddr) -> Self {
+        let learned = LEARNED_GAP_WAIT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&camera_ip)
+            .copied()
+            .unwrap_or(configured);
+        let mut me = Self::unlearned(configured);
+        me.camera_ip = Some(camera_ip);
+        me.current = learned.clamp(configured, Self::MAX.max(configured));
+        me
+    }
+
+    fn unlearned(configured: Duration) -> Self {
+        Self {
+            camera_ip: None,
+            configured,
+            current: configured,
+            skipped: BTreeMap::new(),
+            window_start: Instant::now(),
+            win_skipped: 0,
+            win_late: 0,
+            win_max_late: Duration::ZERO,
+        }
+    }
+
+    fn current(&self) -> Duration {
+        self.current
+    }
+
+    fn store(&self) {
+        if let Some(ip) = self.camera_ip {
+            LEARNED_GAP_WAIT
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(ip, self.current);
+        }
+    }
+
+    /// Packets `from..to` were skipped at `now` after waiting `waited`.
+    fn on_skip(&mut self, from: u32, to: u32, now: Instant, waited: Duration) {
+        let gap_seen = now.checked_sub(waited).unwrap_or(now);
+        for id in from..to {
+            self.skipped.insert(id, gap_seen);
+        }
+        self.win_skipped += u64::from(to.saturating_sub(from));
+        // Bound memory: drop old entries, and never keep more than a few thousand.
+        self.skipped
+            .retain(|_, seen| now.saturating_duration_since(*seen) < Self::REMEMBER);
+        while self.skipped.len() > 4096 {
+            self.skipped.pop_first();
+        }
+    }
+
+    /// Packet `id` arrived behind the contiguous point. If it was skipped,
+    /// record how late it was and maybe raise the wait.
+    fn on_late(&mut self, id: u32, now: Instant) -> Option<LateRetransmit> {
+        let seen = self.skipped.remove(&id)?;
+        let after_gap = now.saturating_duration_since(seen);
+        if after_gap >= Self::REMEMBER {
+            return None;
+        }
+        self.win_late += 1;
+        self.win_max_late = self.win_max_late.max(after_gap);
+        let wanted = (after_gap + Self::MARGIN).min(Self::MAX);
+        let raised_to = (wanted > self.current).then(|| {
+            self.current = wanted;
+            self.store();
+            wanted
+        });
+        Some(LateRetransmit {
+            after_gap,
+            raised_to,
+        })
+    }
+
+    /// Once a minute: decay the wait if no late retransmits were seen, and
+    /// return a summary line if anything was skipped.
+    fn minute_summary(&mut self, now: Instant) -> Option<String> {
+        if now.saturating_duration_since(self.window_start) < Self::SUMMARY_EVERY {
+            return None;
+        }
+        if self.win_late == 0 && self.current > self.configured {
+            self.current = self
+                .current
+                .saturating_sub(Self::DECAY)
+                .max(self.configured);
+            self.store();
+        }
+        let summary = (self.win_skipped > 0).then(|| {
+            format!(
+                "last minute skipped {} packet(s); {} retransmit(s) arrived after their skip (latest {}ms after the gap); gap wait now {}ms (configured {}ms)",
+                self.win_skipped,
+                self.win_late,
+                self.win_max_late.as_millis(),
+                self.current.as_millis(),
+                self.configured.as_millis()
+            )
+        });
+        self.window_start = now;
+        self.win_skipped = 0;
+        self.win_late = 0;
+        self.win_max_late = Duration::ZERO;
+        summary
+    }
+}
+
 fn set_udp_buffer_sizes(socket: &std::net::UdpSocket, size: usize) {
     let sock_ref = SockRef::from(socket);
     if let Err(e) = sock_ref.set_recv_buffer_size(size) {
@@ -970,6 +1149,78 @@ mod tests {
     use super::*;
 
     const WAIT: Duration = Duration::from_millis(500);
+
+    #[test]
+    fn gap_wait_grows_only_from_late_retransmits() {
+        let t0 = Instant::now();
+        let mut g = GapWait::unlearned(WAIT);
+        // Skip 10..12 after waiting 500 ms.
+        g.on_skip(10, 12, t0 + WAIT, WAIT);
+        // Unknown / never-skipped id: ignored.
+        assert!(g.on_late(99, t0 + WAIT).is_none());
+        assert_eq!(g.current(), WAIT);
+        // Retransmit of 10 arrives 700 ms after the gap was seen.
+        let late = g.on_late(10, t0 + Duration::from_millis(700)).unwrap();
+        assert_eq!(late.after_gap, Duration::from_millis(700));
+        assert_eq!(late.raised_to, Some(Duration::from_millis(850)));
+        assert_eq!(g.current(), Duration::from_millis(850));
+        // Same id again: already consumed.
+        assert!(g.on_late(10, t0 + Duration::from_millis(800)).is_none());
+        // An earlier retransmit does not lower it.
+        let late = g.on_late(11, t0 + Duration::from_millis(600)).unwrap();
+        assert_eq!(late.raised_to, None);
+        assert_eq!(g.current(), Duration::from_millis(850));
+    }
+
+    #[test]
+    fn gap_wait_is_remembered_per_camera() {
+        let ip: std::net::IpAddr = "10.255.0.7".parse().unwrap();
+        let t0 = Instant::now();
+        let mut g = GapWait::new(WAIT, ip);
+        assert_eq!(g.current(), WAIT);
+        g.on_skip(1, 2, t0 + WAIT, WAIT);
+        g.on_late(1, t0 + Duration::from_millis(900)).unwrap();
+        // A new connection to the same camera starts from the learned value.
+        assert_eq!(
+            GapWait::new(WAIT, ip).current(),
+            Duration::from_millis(1050)
+        );
+        // Another camera is unaffected.
+        assert_eq!(
+            GapWait::new(WAIT, "10.255.0.8".parse().unwrap()).current(),
+            WAIT
+        );
+    }
+
+    #[test]
+    fn gap_wait_is_capped() {
+        let t0 = Instant::now();
+        let mut g = GapWait::unlearned(WAIT);
+        g.on_skip(1, 2, t0 + WAIT, WAIT);
+        g.on_late(1, t0 + Duration::from_millis(4000)).unwrap();
+        assert_eq!(g.current(), GapWait::MAX);
+    }
+
+    #[test]
+    fn gap_wait_decays_back_without_late_retransmits() {
+        let t0 = Instant::now();
+        let mut g = GapWait::unlearned(WAIT);
+        g.on_skip(1, 2, t0 + WAIT, WAIT);
+        g.on_late(1, t0 + Duration::from_millis(700)).unwrap();
+        g.window_start = t0;
+        // Minute with a late retransmit: summary, no decay.
+        let s = g.minute_summary(t0 + Duration::from_secs(61)).unwrap();
+        assert!(s.contains("1 retransmit"), "{s}");
+        assert_eq!(g.current(), Duration::from_millis(850));
+        // Quiet minute: decays by 100 ms, no summary (nothing skipped).
+        assert!(g.minute_summary(t0 + Duration::from_secs(122)).is_none());
+        assert_eq!(g.current(), Duration::from_millis(750));
+        // Never below the configured value.
+        for i in 3..10 {
+            g.minute_summary(t0 + Duration::from_secs(61 * i));
+        }
+        assert_eq!(g.current(), WAIT);
+    }
 
     #[test]
     fn no_skip_without_gap() {

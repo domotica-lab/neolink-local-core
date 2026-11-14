@@ -10,6 +10,16 @@ Format loosely based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## 1.0.9 (Neolink Local)
+
+- **Fewer corrupted frames on lossy Wi-Fi: the UDP gap wait adapts to the
+  camera.** Reolink cameras resend a lost packet on their own timer, so its
+  retransmit often arrived just after the fixed 500 ms `udp_gap_skip_ms` and was
+  silently thrown away while the skip had already corrupted the picture. Neolink
+  now notices such late retransmits and waits long enough for them (up to 2 s,
+  remembered per camera), and relaxes back when they stop. A once-a-minute
+  `UDP loss from …` log line reports skipped packets and late retransmits.
+
 ## 1.0.8 (Neolink Local)
 
 - **Automatic TCP now also reaches `always` cameras.** In 1.0.7 the saved
