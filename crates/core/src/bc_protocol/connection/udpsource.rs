@@ -988,7 +988,11 @@ struct LateRetransmit {
 }
 
 impl GapWait {
-    const MAX: Duration = Duration::from_millis(2000);
+    /// Field data (two cameras, lossy Wi-Fi): the camera's first retransmit
+    /// lands ~0.8 s after the gap; later ones (1.5–5 s) are its backed-off
+    /// re-retransmits. Waiting for those costs a multi-second freeze per loss
+    /// for little gain, so the wait is capped just above the first wave.
+    const MAX: Duration = Duration::from_millis(1200);
     const MARGIN: Duration = Duration::from_millis(150);
     const DECAY: Duration = Duration::from_millis(100);
     const SUMMARY_EVERY: Duration = Duration::from_secs(60);

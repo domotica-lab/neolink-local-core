@@ -16,6 +16,10 @@ Format loosely based on [Keep a Changelog](https://keepachangelog.com/).
   service, so the automatic TCP attempt only cost them time. A camera that has
   reported a battery level (now, or in a reading saved before a restart) goes
   straight to UDP discovery.
+- **Adaptive gap wait capped at 1.2 s (was 2 s).** Field logs from 1.0.9 show
+  the camera's first retransmit arriving ~0.8 s after the gap and its later
+  re-retransmits at 1.5–5 s; waiting up to 2 s for those froze the picture for
+  2 s on every loss while still missing most of them.
 
 ## 1.0.9 (Neolink Local)
 

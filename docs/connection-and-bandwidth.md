@@ -238,7 +238,9 @@ Reading the heartbeat:
   often lands just after a fixed 500 ms deadline and was silently dropped while
   the skip had already corrupted the frame. `GapWait` (`udpsource.rs`)
   remembers skipped ids for 5 s; when one arrives late it raises the effective
-  wait to that delay + 150 ms (cap 2000 ms), remembered per camera IP across
+  wait to that delay + 150 ms (cap 1200 ms: field data shows the first
+  retransmit at ~0.8 s and backed-off re-retransmits at 1.5–5 s, which are not
+  worth a multi-second freeze), remembered per camera IP across
   reconnects. It only grows from observed late retransmits and decays by 100 ms
   per minute without them, never below the configured value. Once a minute an
   `info` line `UDP loss from <ip>: last minute skipped N packet(s); M
