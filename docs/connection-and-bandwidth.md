@@ -233,7 +233,14 @@ Reading the heartbeat:
   that a retransmit (NAKed via the selective-ACK bitmap on every received packet) has
   several round-trips to land before a skip is attempted.
 
-  **Adaptive:** the camera resends a missing packet on its own timer rather
+  **Adaptive mode is OFF** (`ADAPTIVE_GAP_WAIT = false` since 1.0.13): in
+  field use, waiting up to 1.2 s on every loss froze the picture almost
+  continuously on a camera losing 30–55 packets a minute and slowed stream
+  start-up, while the fixed 500 ms skip only smears a frame and keeps the video
+  moving. The mechanism below is kept (and still counts late retransmits for
+  the summary line) but does not raise the wait.
+
+  **Adaptive (when enabled):** the camera resends a missing packet on its own timer rather
   than immediately on the selective-ACK NAK, so on a lossy link the retransmit
   often lands just after a fixed 500 ms deadline and was silently dropped while
   the skip had already corrupted the frame. `GapWait` (`udpsource.rs`)

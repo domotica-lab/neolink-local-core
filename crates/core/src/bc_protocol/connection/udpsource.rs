@@ -524,7 +524,7 @@ impl UdpPayloadInner {
             }
         });
 
-        let gap_wait = GapWait::new(gap_skip_wait, camera_addr.ip());
+        let gap_wait = GapWait::new(gap_skip_wait, camera_addr.ip(), ADAPTIVE_GAP_WAIT);
         if gap_wait.current() > gap_skip_wait {
             log::info!(
                 "UDP gap skip wait set to {}ms (configured {}ms, learned from earlier late retransmits)",
@@ -986,6 +986,15 @@ fn gap_to_skip<T>(
 /// long after the gap it came and raises the wait to cover that (plus a
 /// margin, capped at [`GapWait::MAX`]). Without late retransmits the wait never
 /// grows, and it decays back to the configured value when they stop.
+/// Whether the gap wait adapts to late retransmits (see [`GapWait`]).
+///
+/// Off: field use showed that waiting up to 1.2 s on every loss (a lossy
+/// Wi-Fi camera loses 30–55 packets a minute) froze the picture almost
+/// continuously and slowed stream start-up, while the fixed 500 ms skip only
+/// smears a frame until the next keyframe and keeps the video moving. Late
+/// retransmits are still counted for the per-minute summary.
+const ADAPTIVE_GAP_WAIT: bool = false;
+
 /// Gap wait learned per camera IP, kept across reconnects (on-demand cameras
 /// reconnect often and would otherwise relearn it every time).
 static LEARNED_GAP_WAIT: std::sync::LazyLock<
@@ -993,6 +1002,8 @@ static LEARNED_GAP_WAIT: std::sync::LazyLock<
 > = std::sync::LazyLock::new(Default::default);
 
 struct GapWait {
+    /// Raise the wait from late retransmits (`ADAPTIVE_GAP_WAIT`).
+    adaptive: bool,
     camera_ip: Option<std::net::IpAddr>,
     configured: Duration,
     current: Duration,
@@ -1026,21 +1037,25 @@ impl GapWait {
     /// Forget skipped ids after this long (a retransmit later than this is useless).
     const REMEMBER: Duration = Duration::from_secs(5);
 
-    fn new(configured: Duration, camera_ip: std::net::IpAddr) -> Self {
-        let learned = LEARNED_GAP_WAIT
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&camera_ip)
-            .copied()
-            .unwrap_or(configured);
+    fn new(configured: Duration, camera_ip: std::net::IpAddr, adaptive: bool) -> Self {
         let mut me = Self::unlearned(configured);
+        me.adaptive = adaptive;
         me.camera_ip = Some(camera_ip);
-        me.current = learned.clamp(configured, Self::MAX.max(configured));
+        if adaptive {
+            let learned = LEARNED_GAP_WAIT
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&camera_ip)
+                .copied()
+                .unwrap_or(configured);
+            me.current = learned.clamp(configured, Self::MAX.max(configured));
+        }
         me
     }
 
     fn unlearned(configured: Duration) -> Self {
         Self {
+            adaptive: true,
             camera_ip: None,
             configured,
             current: configured,
@@ -1100,7 +1115,7 @@ impl GapWait {
         self.win_late += 1;
         self.win_max_late = self.win_max_late.max(after_gap);
         let wanted = (after_gap + Self::MARGIN).min(Self::MAX);
-        let raised_to = (wanted > self.current).then(|| {
+        let raised_to = (self.adaptive && wanted > self.current).then(|| {
             self.current = wanted;
             self.store();
             wanted
@@ -1236,20 +1251,36 @@ mod tests {
     fn gap_wait_is_remembered_per_camera() {
         let ip: std::net::IpAddr = "10.255.0.7".parse().unwrap();
         let t0 = Instant::now();
-        let mut g = GapWait::new(WAIT, ip);
+        let mut g = GapWait::new(WAIT, ip, true);
         assert_eq!(g.current(), WAIT);
         g.on_skip(1, 2, t0 + WAIT, WAIT);
         g.on_late(1, t0 + Duration::from_millis(900)).unwrap();
         // A new connection to the same camera starts from the learned value.
         assert_eq!(
-            GapWait::new(WAIT, ip).current(),
+            GapWait::new(WAIT, ip, true).current(),
             Duration::from_millis(1050)
         );
         // Another camera is unaffected.
         assert_eq!(
-            GapWait::new(WAIT, "10.255.0.8".parse().unwrap()).current(),
+            GapWait::new(WAIT, "10.255.0.8".parse().unwrap(), true).current(),
             WAIT
         );
+    }
+
+    #[test]
+    fn fixed_gap_wait_never_grows_but_still_counts_late_retransmits() {
+        let ip: std::net::IpAddr = "10.255.0.9".parse().unwrap();
+        let t0 = Instant::now();
+        let mut g = GapWait::new(WAIT, ip, false);
+        g.window_start = t0;
+        g.on_skip(1, 3, t0 + WAIT, WAIT);
+        let late = g.on_late(1, t0 + Duration::from_millis(900)).unwrap();
+        assert_eq!(late.raised_to, None);
+        assert_eq!(g.current(), WAIT);
+        let s = g.minute_summary(t0 + Duration::from_secs(61)).unwrap();
+        assert!(s.contains("skipped 2 packet(s); 1 retransmit"), "{s}");
+        assert_eq!(GapWait::new(WAIT, ip, false).current(), WAIT);
+        assert!(!ADAPTIVE_GAP_WAIT, "production gap wait must stay fixed");
     }
 
     #[test]

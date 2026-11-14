@@ -10,6 +10,17 @@ Format loosely based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## 1.0.13 (Neolink Local)
+
+- **Back to a fixed 500 ms UDP gap wait (adaptive wait disabled).** The
+  adaptive wait added in 1.0.9 waited up to 1.2 s on every lost packet. On a
+  camera losing 30–55 packets a minute that froze the picture almost
+  continuously and made streams slow to start; users reported the video was
+  smoother before. A skip at 500 ms only smears a frame until the next keyframe
+  and keeps the video moving. The per-minute `UDP loss` summary (skipped
+  packets, late retransmits, decoder blocking) stays. All other 1.0.6–1.0.12
+  fixes are kept.
+
 ## 1.0.12 (Neolink Local)
 
 - **One unreadable UDP datagram no longer drops the camera.** During
