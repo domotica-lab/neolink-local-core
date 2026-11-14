@@ -40,6 +40,12 @@ const MTU: usize = 1350;
 const UDPDATA_HEADER_SIZE: usize = 20;
 const SOCKET_IN_CAPACITY: usize = 4096;
 const SOCKET_OUT_CAPACITY: usize = 32768;
+/// See `UdpPayloadSource::new`: reassembled packets queued for the decoder.
+const DELIVERY_CAPACITY: usize = 2048;
+/// Most packets one ACK's selective bitmap covers (1 byte each), so the ACK
+/// always fits one datagram (MTU 1350 - 28-byte header). A fragmented ACK on
+/// Wi-Fi is far more likely to be lost, which the camera reads as loss.
+const ACK_BITMAP_CAP: u32 = 1000;
 /// How long the reassembler waits for a missing packet before skipping it.
 ///
 /// A skipped packet desyncs the framing for one message; the BC control codec
@@ -662,7 +668,9 @@ impl UdpPayloadInner {
             log::trace!("  + {}", self.packets_want);
             self.packets_want += 1;
             self.stat_delivered += 1;
+            let feed_started = Instant::now();
             self.thread_stream.feed(Ok(payload)).await?;
+            self.gap_wait.on_delivery_wait(feed_started.elapsed());
             self.last_delivery_at = Instant::now();
         }
         if let Some(summary) = self.gap_wait.minute_summary(Instant::now()) {
@@ -715,22 +723,7 @@ impl UdpPayloadInner {
                 // Happens if we have recieved but not consumed yet
                 first_missing += 1;
             }
-            let missing_ids = if let Some(end) = self.recieved.keys().max() {
-                let mut vec = vec![];
-                // From last contiguous packet to last recieved packet
-                // create a payload of `00` (unreceived) and `01` (received)
-                // that can be used to form the `UdpAck` packet
-                for i in (first_missing)..(end + 1) {
-                    if self.recieved.contains_key(&i) {
-                        vec.push(1)
-                    } else {
-                        vec.push(0)
-                    }
-                }
-                vec
-            } else {
-                vec![]
-            };
+            let missing_ids = ack_bitmap(first_missing, &self.recieved);
 
             UdpAck {
                 connection_id: self.camera_id,
@@ -798,7 +791,12 @@ impl UdpPayloadSource {
         gap_skip_wait: Duration,
     ) -> Self {
         let (inner_sink, thread_sink) = channel(100);
-        let (thread_stream, inner_stream) = channel(100);
+        // Reassembled packets handed to the BC decoder. Must hold several
+        // main-stream keyframes (~200 packets each): while it is full,
+        // `run()` blocks in `feed()`, so it stops processing arrivals and the
+        // ACK it publishes goes stale — the camera reads that as a poor link
+        // and throttles/resends (same stall Reoling measured on hardware).
+        let (thread_stream, inner_stream) = channel(DELIVERY_CAPACITY);
 
         let mut payload_inner = UdpPayloadInner::new(
             inner,
@@ -978,6 +976,8 @@ struct GapWait {
     win_skipped: u64,
     win_late: u64,
     win_max_late: Duration,
+    /// Time `run()` spent blocked handing packets to the decoder this window.
+    win_delivery_blocked: Duration,
 }
 
 struct LateRetransmit {
@@ -1022,6 +1022,15 @@ impl GapWait {
             win_skipped: 0,
             win_late: 0,
             win_max_late: Duration::ZERO,
+            win_delivery_blocked: Duration::ZERO,
+        }
+    }
+
+    /// Record time spent waiting for room in the decoder channel. Only waits
+    /// over 1 ms count (an immediate send takes microseconds).
+    fn on_delivery_wait(&mut self, waited: Duration) {
+        if waited > Duration::from_millis(1) {
+            self.win_delivery_blocked += waited;
         }
     }
 
@@ -1088,22 +1097,42 @@ impl GapWait {
                 .max(self.configured);
             self.store();
         }
-        let summary = (self.win_skipped > 0).then(|| {
+        let blocked = self.win_delivery_blocked;
+        let summary = (self.win_skipped > 0 || blocked >= Duration::from_millis(100)).then(|| {
             format!(
-                "last minute skipped {} packet(s); {} retransmit(s) arrived after their skip (latest {}ms after the gap); gap wait now {}ms (configured {}ms)",
+                "last minute skipped {} packet(s); {} retransmit(s) arrived after their skip (latest {}ms after the gap); gap wait now {}ms (configured {}ms); delivery to decoder blocked {}ms",
                 self.win_skipped,
                 self.win_late,
                 self.win_max_late.as_millis(),
                 self.current.as_millis(),
-                self.configured.as_millis()
+                self.configured.as_millis(),
+                blocked.as_millis()
             )
         });
         self.window_start = now;
         self.win_skipped = 0;
         self.win_late = 0;
         self.win_max_late = Duration::ZERO;
+        self.win_delivery_blocked = Duration::ZERO;
         summary
     }
+}
+
+/// Selective-ACK bitmap: one byte per packet from `first_missing` (which we
+/// lack) up to the highest buffered packet — `1` = received out of order,
+/// `0` = still missing — capped at [`ACK_BITMAP_CAP`] entries so the ACK fits
+/// one datagram.
+fn ack_bitmap<T>(first_missing: u32, recieved: &BTreeMap<u32, T>) -> Vec<u8> {
+    let Some(&highest) = recieved.keys().next_back() else {
+        return vec![];
+    };
+    let end = highest.min(first_missing.saturating_add(ACK_BITMAP_CAP - 1));
+    if end < first_missing {
+        return vec![];
+    }
+    (first_missing..=end)
+        .map(|id| u8::from(recieved.contains_key(&id)))
+        .collect()
 }
 
 fn set_udp_buffer_sizes(socket: &std::net::UdpSocket, size: usize) {
@@ -1224,6 +1253,35 @@ mod tests {
             g.minute_summary(t0 + Duration::from_secs(61 * i));
         }
         assert_eq!(g.current(), WAIT);
+    }
+
+    #[test]
+    fn ack_bitmap_marks_received_and_missing() {
+        let mut r = BTreeMap::new();
+        assert!(ack_bitmap(10, &r).is_empty());
+        r.insert(11u32, ());
+        r.insert(13u32, ());
+        assert_eq!(ack_bitmap(10, &r), vec![0, 1, 0, 1]);
+    }
+
+    #[test]
+    fn ack_bitmap_fits_one_datagram() {
+        let mut r = BTreeMap::new();
+        r.insert(5000u32, ());
+        let bitmap = ack_bitmap(10, &r);
+        assert_eq!(bitmap.len(), ACK_BITMAP_CAP as usize);
+        assert!(bitmap.len() + 28 <= MTU);
+    }
+
+    #[test]
+    fn delivery_blocking_is_reported() {
+        let t0 = Instant::now();
+        let mut g = GapWait::unlearned(WAIT);
+        g.window_start = t0;
+        g.on_delivery_wait(Duration::from_micros(50)); // immediate send: ignored
+        g.on_delivery_wait(Duration::from_millis(300));
+        let s = g.minute_summary(t0 + Duration::from_secs(61)).unwrap();
+        assert!(s.contains("blocked 300ms"), "{s}");
     }
 
     #[test]

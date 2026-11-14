@@ -246,6 +246,14 @@ Reading the heartbeat:
   `info` line `UDP loss from <ip>: last minute skipped N packet(s); M
   retransmit(s) arrived after their skip …` summarises it.
 
+  **Never stall the receive loop.** `run()` hands reassembled packets to the
+  BC decoder through a bounded channel (`DELIVERY_CAPACITY` = 2048, several
+  keyframes). While it is full `run()` blocks in `feed()`: arrivals queue
+  unprocessed and the published ACK goes stale, which the camera reads as a
+  poor link (throttle/resend). The per-minute summary reports
+  `delivery to decoder blocked Nms`. The selective-ACK bitmap is capped at
+  `ACK_BITMAP_CAP` = 1000 entries so an ACK never exceeds one datagram.
+
   A skip punches a hole in the reassembled byte stream, which desyncs the BC framing
   for one message. Both the control codec (`BcCodex`) and the media codec
   (`BcMediaCodex`) recover by scanning forward to the next BC header magic and

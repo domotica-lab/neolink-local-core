@@ -10,6 +10,18 @@ Format loosely based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## 1.0.11 (Neolink Local)
+
+- **The UDP receive loop no longer stalls behind the decoder.** Reassembled
+  packets went to the decoder through a 100-packet channel, smaller than one
+  main-stream keyframe (~200 packets). When it filled, the loop stopped
+  processing arrivals and its ACK went stale, which the camera reads as a poor
+  link (it throttles and resends) — the same stall the Reoling project measured
+  on real hardware. The channel now holds 2048 packets, and the per-minute
+  `UDP loss` line reports any remaining `delivery to decoder blocked` time.
+- **ACKs always fit one datagram:** the selective-ACK bitmap is capped at 1000
+  packets.
+
 ## 1.0.10 (Neolink Local)
 
 - **No TCP probe at all for battery cameras.** Battery Reolinks have no TCP
