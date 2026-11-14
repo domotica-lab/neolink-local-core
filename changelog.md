@@ -10,6 +10,17 @@ Format loosely based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## 1.0.12 (Neolink Local)
+
+- **One unreadable UDP datagram no longer drops the camera.** During
+  streaming, any datagram the decoder could not parse ended the socket task,
+  which surfaced as `Connection Lost: BcUDP reciver dropped: NoneRecieved` and a
+  3–7 s reconnect — seen on lossy Wi-Fi right after bursts of skipped packets.
+  Such datagrams are now dropped and counted (as discovery already did); the
+  codec discards the bad bytes, because `UdpFramed` would otherwise re-decode
+  the same datagram forever. Genuinely fatal socket errors are now logged with
+  their real cause (`UDP socket to … closed: …`) instead of only `NoneRecieved`.
+
 ## 1.0.11 (Neolink Local)
 
 - **The UDP receive loop no longer stalls behind the decoder.** Reassembled

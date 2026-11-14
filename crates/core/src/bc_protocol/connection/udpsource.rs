@@ -360,6 +360,8 @@ impl UdpPayloadInner {
         set.spawn(async move {
             let mut dropped = 0u64;
             let mut last_drop_log = Instant::now();
+            let mut bad_datagrams = 0u64;
+            let mut last_bad_log = Instant::now() - Duration::from_secs(60);
             let result = tokio::select! {
                 _ = send_cancel.cancelled() => {
                     Result::Ok(())
@@ -372,7 +374,27 @@ impl UdpPayloadInner {
                             }
                             packet = inner.next() => {
                                 log::trace!("Cam->App");
-                                let packet = packet.ok_or(Error::BcUdpDropReciver(BcUdpDropReciverKind::NoneRecieved))??;
+                                let packet = match packet.ok_or(Error::BcUdpDropReciver(BcUdpDropReciverKind::NoneRecieved))? {
+                                    Ok(packet) => packet,
+                                    // One datagram we cannot parse (corrupt, or a
+                                    // message type we do not model) must not tear
+                                    // down a working stream: drop it and go on,
+                                    // as discovery already does. The codec has
+                                    // discarded it, so the next read is clean.
+                                    Err(e) if super::discovery::is_unparseable_datagram(&e) => {
+                                        bad_datagrams += 1;
+                                        if last_bad_log.elapsed() >= Duration::from_secs(60) {
+                                            log::info!(
+                                                "UDP from {}: ignored {} unparseable datagram(s) (last: {e:?})",
+                                                thread_camera_addr, bad_datagrams
+                                            );
+                                            bad_datagrams = 0;
+                                            last_bad_log = Instant::now();
+                                        }
+                                        continue;
+                                    }
+                                    Err(e) => return Err(e),
+                                };
                                 recv_timeout.as_mut().reset(Instant::now() + Duration::from_secs(TIME_OUT));
                                 // let packet = socket_rx.next().await.ok_or(Error::BcUdpDropReciver)??;
                                 match socket_out_tx.try_send(packet) {
@@ -441,6 +463,11 @@ impl UdpPayloadInner {
                 } => v,
             };
             send_cancel.cancel();
+            // The receive loop only sees this as its channel closing
+            // (`NoneRecieved`), so name the real cause here.
+            if let Err(e) = &result {
+                log::warn!("UDP socket to {} closed: {e:?}", thread_camera_addr);
+            }
             result
         });
 

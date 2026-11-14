@@ -44,7 +44,7 @@ use tokio_util::udp::UdpFramed;
 /// magic mismatch, surfaced as `Error::NomError`, lands here. Every other
 /// error kind (relay/camera terminate signals, real socket IO failures) stays
 /// fatal so the reader loop tears down as before.
-fn is_unparseable_datagram(e: &Error) -> bool {
+pub(crate) fn is_unparseable_datagram(e: &Error) -> bool {
     matches!(e, Error::NomError(_))
 }
 

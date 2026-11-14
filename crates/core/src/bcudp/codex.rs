@@ -64,6 +64,11 @@ impl Decoder for BcUdpCodex {
             }
             Err(e) => {
                 log::trace!("   Decoding: Err");
+                // Drop the rest of this datagram. `UdpFramed` keeps the read
+                // buffer on a decode error and decodes the very same bytes again
+                // on the next poll, so without this one bad datagram would
+                // return the same error forever and could never be skipped.
+                src.clear();
                 Err(e)
             }
         }
@@ -90,5 +95,13 @@ mod tests {
         let result = BcUdpCodex::new().decode(&mut buf);
 
         assert_matches!(result, Err(Error::NomError(_)));
+    }
+
+    #[test]
+    fn bad_datagram_is_dropped_so_the_next_one_decodes() {
+        let mut codex = BcUdpCodex::new();
+        let mut buf = BytesMut::from(&b"NEXUSjunkjunkjunkjunkjunk"[..]);
+        assert!(codex.decode(&mut buf).is_err());
+        assert!(buf.is_empty(), "bad datagram must be discarded");
     }
 }
