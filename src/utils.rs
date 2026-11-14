@@ -157,6 +157,10 @@ pub(crate) async fn connect_and_login(camera_config: &CameraConfig) -> Result<Bc
     timeout(camera.login_with_maxenc(max_encryption))
         .await
         .with_context(|| format!("Failed to login to {}", camera_config.name))??;
+    camera
+        .verify_auto_tcp()
+        .await
+        .with_context(|| format!("{}: TCP address check failed", camera_config.name))?;
 
     info!(
         "{}: Connected and logged in ({:.1}s: found in {:.1}s, login {:.1}s)",

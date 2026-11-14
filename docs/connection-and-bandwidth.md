@@ -18,6 +18,24 @@ Neolink registers with Reolink's lookup servers (region selected by
 
 The `discovery` setting selects which addresses Neolink attempts.
 
+### Automatic TCP for UID cameras
+
+A camera configured with only a `uid` (no `address`) on `discovery = "local"`
+(or `debug`) is first tried over **TCP port 9000 at the IP it last answered
+local discovery from** (`last_local_address`, persisted across restarts).
+Mains-powered cameras serve TCP there; TCP retransmits lost packets itself, so a
+lossy Wi-Fi link no longer becomes skipped UDP packets (`UDP payload gap`) and
+corrupted frames. Log: `MEDIA PATH: TCP over LAN to <ip>:9000 (NOT UDP P2P)`.
+
+- The probe uses a 1.5 s connect timeout. **Refused** (no TCP service, e.g.
+  battery cameras) disables it for that camera until restart; **no answer**
+  defers it for 30 min. Otherwise the usual UDP discovery runs unchanged.
+- After login the camera's UID is read (`MSG_ID_UID`) and compared with the
+  configured one (`BcCamera::verify_auto_tcp`), because DHCP may have handed the
+  old IP to another Reolink camera. On a mismatch the connection is dropped, the
+  attempt deferred, and the reconnect finds the camera by UID over UDP.
+- A configured `address` keeps its existing behaviour (TCP to that address).
+
 ## `discovery` methods
 
 Set per-camera (`discovery = "..."`). Default is `relay`.

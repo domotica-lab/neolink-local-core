@@ -121,6 +121,45 @@ lazy_static! {
         std::sync::Mutex::new(HashMap::new());
 }
 
+lazy_static! {
+    /// Cameras for which the automatic TCP attempt (see
+    /// [`tcp_auto_allowed`]) failed. `None` = the port was refused, so the camera
+    /// has no TCP service (battery models): never try again in this process.
+    /// `Some(t)` = no answer (asleep/unreachable): try again after `t`.
+    static ref TCP_AUTO_FAILED: std::sync::Mutex<HashMap<String, Option<Instant>>> =
+        std::sync::Mutex::new(HashMap::new());
+}
+
+/// How long to wait before re-trying automatic TCP after it timed out.
+const TCP_AUTO_RETRY_AFTER: Duration = Duration::from_secs(30 * 60);
+
+/// Whether the automatic TCP attempt at the last known address may be made for
+/// `uid` now.
+pub(crate) fn tcp_auto_allowed(uid: &str) -> bool {
+    match TCP_AUTO_FAILED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(uid)
+    {
+        None => true,
+        Some(None) => false,
+        Some(Some(retry_at)) => Instant::now() >= *retry_at,
+    }
+}
+
+/// Record the outcome of an automatic TCP attempt for `uid`.
+/// `refused`: the camera actively refused the port (no TCP service).
+pub(crate) fn tcp_auto_result(uid: &str, ok: bool, refused: bool) {
+    let mut failed = TCP_AUTO_FAILED.lock().unwrap_or_else(|e| e.into_inner());
+    if ok {
+        failed.remove(uid);
+    } else if refused {
+        failed.insert(uid.to_string(), None);
+    } else {
+        failed.insert(uid.to_string(), Some(Instant::now() + TCP_AUTO_RETRY_AFTER));
+    }
+}
+
 /// Address `uid` answered local discovery from last time, if known.
 pub fn last_local_address(uid: &str) -> Option<std::net::IpAddr> {
     LAST_LOCAL_IP
@@ -1860,5 +1899,20 @@ mod tests {
         assert!(!is_unparseable_datagram(&Error::Io(Arc::new(
             std::io::Error::other("boom")
         ))));
+    }
+
+    #[test]
+    fn tcp_auto_failure_memory() {
+        let uid = "TESTUIDTCPAUTO01";
+        assert!(tcp_auto_allowed(uid));
+        // No answer: deferred, so not allowed right now.
+        tcp_auto_result(uid, false, false);
+        assert!(!tcp_auto_allowed(uid));
+        // A later success clears it.
+        tcp_auto_result(uid, true, false);
+        assert!(tcp_auto_allowed(uid));
+        // Refused: never again.
+        tcp_auto_result(uid, false, true);
+        assert!(!tcp_auto_allowed(uid));
     }
 }

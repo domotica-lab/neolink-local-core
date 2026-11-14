@@ -10,6 +10,17 @@ Format loosely based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## 1.0.7 (Neolink Local)
+
+- **Mains-powered UID cameras use TCP automatically.** With only a `uid`
+  configured, Neolink always used UDP P2P, where a lost Wi-Fi packet becomes a
+  skipped packet and a corrupted frame. It now first tries TCP port 9000 at the
+  camera's last known LAN address (as the Reolink app does); TCP retransmits
+  losses itself. The camera's UID is checked after login, so a reassigned IP
+  never connects to the wrong camera. Battery cameras (no TCP service) fall back
+  to UDP as before, paying at most a 1.5 s probe once. No config change needed.
+  See `docs/connection-and-bandwidth.md` "Automatic TCP for UID cameras".
+
 ## 1.0.6 (Neolink Local)
 
 - **No more lost video (and `header.msg_id: 3` log floods) when a stream's first
