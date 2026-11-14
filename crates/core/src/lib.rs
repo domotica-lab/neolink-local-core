@@ -27,6 +27,7 @@
 //!     debug: false,
 //!     max_discovery_retries: 10,
 //!     udp_gap_skip_ms: None,
+//!     skip_auto_tcp: false,
 //! };
 //! let mut camera = BcCamera::new(&options).await.unwrap();
 //! # })
@@ -53,6 +54,7 @@
 //! #    debug: false,
 //! #    max_discovery_retries: 10,
 //! #    udp_gap_skip_ms: None,
+//! #    skip_auto_tcp: false,
 //! # };
 //! # let mut camera = BcCamera::new(&options).await.unwrap();
 //! camera.login().await;

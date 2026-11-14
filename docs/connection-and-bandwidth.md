@@ -41,6 +41,12 @@ corrupted frames. Log: `MEDIA PATH: TCP over LAN to <ip>:9000 (NOT UDP P2P)`.
   restored in `main` before the reactor starts, because `always` cameras connect
   at startup and then stay connected (the status API that also persists them
   starts later).
+- **Battery cameras are skipped entirely** (`BcCameraOpt::skip_auto_tcp`): a
+  camera is known to be battery-powered once it has reported a battery level
+  (`utils::mark_battery_camera`, called from `record_battery`) or, at start-up,
+  when a saved reading `snapshots/<name>.battery.json` exists
+  (`seed_battery_cameras`, run before the reactor). Battery Reolinks have no TCP
+  service, so they get no probe and no wait: straight to UDP discovery.
 - A configured `address` keeps its existing behaviour (TCP to that address).
 
 ## `discovery` methods

@@ -317,6 +317,7 @@ fn record_battery(camera: &str, info: &neolink_core::bc::xml::BatteryInfo) {
         state.percent,
         state.charge_status
     );
+    crate::utils::mark_battery_camera(camera);
     seed_battery(camera, state);
 }
 

@@ -93,6 +93,7 @@ impl AddressOrUid {
             debug: camera_config.debug,
             max_discovery_retries: camera_config.max_discovery_retries,
             udp_gap_skip_ms: camera_config.udp_gap_skip_ms,
+            skip_auto_tcp: is_battery_camera(&camera_config.name),
         };
 
         trace!("Camera Info: {:?}", options);
@@ -179,13 +180,15 @@ pub(crate) async fn connect_and_login(camera_config: &CameraConfig) -> Result<Bc
 /// so the addresses must be known by then for the automatic TCP attempt to
 /// run (the status API itself only starts after the cameras).
 pub(crate) fn seed_saved_addresses(stream_cache_path: Option<&str>) {
-    let Some(file) = stream_cache_path
-        .filter(|p| !p.is_empty())
-        .and_then(|p| std::path::Path::new(p).parent().map(|d| d.to_path_buf()))
-        .map(|d| d.join("snapshots").join("addresses.json"))
-    else {
+    let Some(dir) = stream_cache_path.filter(|p| !p.is_empty()).and_then(|p| {
+        std::path::Path::new(p)
+            .parent()
+            .map(|d| d.join("snapshots"))
+    }) else {
         return;
     };
+    seed_battery_cameras(&dir);
+    let file = dir.join("addresses.json");
     let Ok(bytes) = std::fs::read(&file) else {
         return;
     };
@@ -197,6 +200,72 @@ pub(crate) fn seed_saved_addresses(stream_cache_path: Option<&str>) {
     if !addrs.is_empty() {
         info!("Restored last known address of {} camera(s)", addrs.len());
     }
+}
+
+/// Cameras known to run on a battery (they have reported a battery level),
+/// by sanitised name ([`battery_file_stem`]).
+/// Battery Reolinks sleep and have no TCP service, so the automatic TCP
+/// attempt is skipped for them: no probe, no wait, straight to UDP.
+static BATTERY_CAMERAS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Record that `camera` reported a battery level.
+#[cfg_attr(not(feature = "gstreamer"), allow(dead_code))]
+pub(crate) fn mark_battery_camera(camera: &str) {
+    BATTERY_CAMERAS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(battery_file_stem(camera));
+}
+
+pub(crate) fn is_battery_camera(camera: &str) -> bool {
+    BATTERY_CAMERAS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&battery_file_stem(camera))
+}
+
+/// Same file-name mapping the status API uses for `<name>.battery.json`.
+fn battery_file_stem(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// At start-up, mark every configured camera with a saved battery reading
+/// (`snapshots/<name>.battery.json`, written by the status API) as a battery
+/// camera, before any camera connects.
+fn seed_battery_cameras(dir: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let stems: std::collections::HashSet<String> = entries
+        .flatten()
+        .filter_map(|e| {
+            e.file_name()
+                .to_str()
+                .and_then(|n| n.strip_suffix(".battery.json"))
+                .map(str::to_string)
+        })
+        .collect();
+    if stems.is_empty() {
+        return;
+    }
+    info!(
+        "Known battery camera(s), automatic TCP skipped: {}",
+        stems.iter().cloned().collect::<Vec<_>>().join(", ")
+    );
+    // The set holds sanitised names, the same form as the file stems.
+    BATTERY_CAMERAS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .extend(stems);
 }
 
 #[cfg(test)]
@@ -218,9 +287,27 @@ mod seed_tests {
             neolink_core::bc_protocol::last_local_address("TESTUIDSEED0001"),
             Some("192.168.68.99".parse().unwrap())
         );
+        assert!(!is_battery_camera("Cancello Nord"));
         // Missing/empty path: no panic, nothing to do.
         seed_saved_addresses(None);
         seed_saved_addresses(Some(""));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn battery_cameras_are_known_from_saved_readings_and_at_runtime() {
+        let dir = std::env::temp_dir().join(format!("neolink-batt-{}", std::process::id()));
+        let snaps = dir.join("snapshots");
+        std::fs::create_dir_all(&snaps).unwrap();
+        // The status API saves "Area Cani" as Area_Cani.battery.json.
+        std::fs::write(snaps.join("Area_Cani.battery.json"), "{}").unwrap();
+        seed_saved_addresses(dir.join("stream-cache.json").to_str());
+        assert!(is_battery_camera("Area Cani"));
+        assert!(is_battery_camera("Area_Cani"));
+        assert!(!is_battery_camera("Garage"));
+        // A camera that reports a battery level while running.
+        mark_battery_camera("Garage");
+        assert!(is_battery_camera("Garage"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

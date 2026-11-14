@@ -125,6 +125,9 @@ pub struct BcCameraOpt {
     pub debug: bool,
     /// UDP gap skip wait in ms for packet reassembly (None uses default).
     pub udp_gap_skip_ms: Option<u64>,
+    /// Do not try TCP automatically for this UID camera (it is known to be a
+    /// battery camera, which has no TCP service): go straight to UDP.
+    pub skip_auto_tcp: bool,
 }
 
 /// Used to choose the print format of various status messages like battery levels
@@ -191,7 +194,8 @@ impl BcCamera {
     /// UID-only, LAN discovery, TCP allowed. Returns the UID.
     fn auto_tcp_uid(options: &BcCameraOpt) -> Option<&String> {
         let uid = options.uid.as_ref()?;
-        let eligible = options.addrs.is_empty()
+        let eligible = !options.skip_auto_tcp
+            && options.addrs.is_empty()
             && matches!(options.protocol, ConnectionProtocol::TcpUdp)
             && matches!(
                 options.discovery,

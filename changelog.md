@@ -10,6 +10,13 @@ Format loosely based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## 1.0.10 (Neolink Local)
+
+- **No TCP probe at all for battery cameras.** Battery Reolinks have no TCP
+  service, so the automatic TCP attempt only cost them time. A camera that has
+  reported a battery level (now, or in a reading saved before a restart) goes
+  straight to UDP discovery.
+
 ## 1.0.9 (Neolink Local)
 
 - **Fewer corrupted frames on lossy Wi-Fi: the UDP gap wait adapts to the
