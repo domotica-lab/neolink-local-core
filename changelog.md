@@ -10,6 +10,15 @@ Format loosely based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## 1.0.8 (Neolink Local)
+
+- **Automatic TCP now also reaches `always` cameras.** In 1.0.7 the saved
+  addresses were restored by the status API, which starts after the cameras:
+  `always` cameras connected at startup without a known address, fell back to
+  UDP and, staying connected, never tried TCP. Addresses are now restored before
+  any camera connects, and TCP is also tried at the IP that just answered UDP
+  local discovery (first run, or a camera that changed IP).
+
 ## 1.0.7 (Neolink Local)
 
 - **Mains-powered UID cameras use TCP automatically.** With only a `uid`

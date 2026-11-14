@@ -34,6 +34,13 @@ corrupted frames. Log: `MEDIA PATH: TCP over LAN to <ip>:9000 (NOT UDP P2P)`.
   configured one (`BcCamera::verify_auto_tcp`), because DHCP may have handed the
   old IP to another Reolink camera. On a mismatch the connection is dropped, the
   attempt deferred, and the reconnect finds the camera by UID over UDP.
+- If no saved address was usable (first run, or the camera changed IP), TCP is
+  also tried at the IP that just answered UDP local discovery, with a 500 ms
+  connect timeout (the camera is awake and the UDP session is waiting).
+- Saved addresses (`snapshots/addresses.json` next to `stream_cache_path`) are
+  restored in `main` before the reactor starts, because `always` cameras connect
+  at startup and then stay connected (the status API that also persists them
+  starts later).
 - A configured `address` keeps its existing behaviour (TCP to that address).
 
 ## `discovery` methods

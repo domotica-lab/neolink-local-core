@@ -161,6 +161,11 @@ enum CameraLocation {
 /// Connect timeout of the automatic TCP attempt at a UID camera's last known
 /// address. Kept short: a sleeping battery camera never answers.
 const TCP_AUTO_CONNECT_WAIT: Duration = Duration::from_millis(1500);
+/// Connect timeout of the automatic TCP attempt right after UDP local
+/// discovery: the camera has just answered from that IP, so it is awake and a
+/// LAN TCP connect completes in milliseconds. Short so the UDP session that
+/// discovery opened is not left waiting.
+const TCP_AUTO_CONNECT_WAIT_AFTER_DISCOVERY: Duration = Duration::from_millis(500);
 
 impl BcCamera {
     /// Probe TCP at `socket`; `Err(true)` = refused (no TCP service),
@@ -169,13 +174,9 @@ impl BcCamera {
         discovery: &Discovery,
         socket: SocketAddr,
         channel_id: u8,
+        connect_wait: Duration,
     ) -> std::result::Result<(), bool> {
-        match tokio::time::timeout(
-            TCP_AUTO_CONNECT_WAIT,
-            tokio::net::TcpStream::connect(socket),
-        )
-        .await
-        {
+        match tokio::time::timeout(connect_wait, tokio::net::TcpStream::connect(socket)).await {
             Ok(Ok(stream)) => drop(stream),
             Ok(Err(e)) if e.kind() == std::io::ErrorKind::ConnectionRefused => return Err(true),
             _ => return Err(false),
@@ -184,6 +185,53 @@ impl BcCamera {
             .check_tcp(socket, channel_id)
             .await
             .map_err(|_| false)
+    }
+
+    /// Whether the automatic TCP attempt applies to this camera at all:
+    /// UID-only, LAN discovery, TCP allowed. Returns the UID.
+    fn auto_tcp_uid(options: &BcCameraOpt) -> Option<&String> {
+        let uid = options.uid.as_ref()?;
+        let eligible = options.addrs.is_empty()
+            && matches!(options.protocol, ConnectionProtocol::TcpUdp)
+            && matches!(
+                options.discovery,
+                DiscoveryMethods::Local | DiscoveryMethods::Debug
+            );
+        eligible.then_some(uid)
+    }
+
+    /// Automatic TCP attempt at `ip`:9000 for a UID-only camera, recording the
+    /// outcome. `Some(socket)` = TCP works, use it.
+    async fn auto_tcp_attempt(
+        discovery: &Discovery,
+        options: &BcCameraOpt,
+        uid: &str,
+        ip: IpAddr,
+        connect_wait: Duration,
+        what: &str,
+    ) -> Option<SocketAddr> {
+        let socket = SocketAddr::new(ip, BC_DEFAULT_PORT);
+        match Self::try_auto_tcp(discovery, socket, options.channel_id, connect_wait).await {
+            Ok(()) => {
+                tcp_auto_result(uid, true, false);
+                info!("{}: TCP at {what} {socket} works; using TCP", options.name);
+                info!("MEDIA PATH: TCP over LAN to {} (NOT UDP P2P)", socket);
+                Some(socket)
+            }
+            Err(refused) => {
+                tcp_auto_result(uid, false, refused);
+                info!(
+                    "{}: no TCP at {what} {socket} ({}); using UDP",
+                    options.name,
+                    if refused {
+                        "port closed, not retried"
+                    } else {
+                        "no answer, retry in 30 min"
+                    }
+                );
+                None
+            }
+        }
     }
 
     /// After login, check that a camera reached by the automatic TCP attempt is
@@ -252,42 +300,20 @@ impl BcCamera {
         // UDP packets and corrupted frames. Battery cameras have no TCP service:
         // a refusal disables this for the camera, a timeout defers it, so they
         // pay at most `TCP_AUTO_CONNECT_WAIT` once.
-        if let (Some(uid), true, ConnectionProtocol::TcpUdp) = (
-            options.uid.as_ref(),
-            options.addrs.is_empty(),
-            options.protocol,
-        ) {
-            if matches!(
-                options.discovery,
-                DiscoveryMethods::Local | DiscoveryMethods::Debug
-            ) && tcp_auto_allowed(uid)
-            {
-                if let Some(ip) = last_local_address(uid) {
-                    let socket = SocketAddr::new(ip, BC_DEFAULT_PORT);
-                    match Self::try_auto_tcp(&discovery, socket, options.channel_id).await {
-                        Ok(()) => {
-                            tcp_auto_result(uid, true, false);
-                            info!(
-                                "{}: TCP at last known address {} works; using TCP",
-                                options.name, socket
-                            );
-                            info!("MEDIA PATH: TCP over LAN to {} (NOT UDP P2P)", socket);
-                            return Ok(CameraLocation::Tcp(socket));
-                        }
-                        Err(refused) => {
-                            tcp_auto_result(uid, false, refused);
-                            info!(
-                                "{}: no TCP at last known address {} ({}); using UDP",
-                                options.name,
-                                socket,
-                                if refused {
-                                    "port closed, not retried"
-                                } else {
-                                    "no answer, retry in 30 min"
-                                }
-                            );
-                        }
-                    }
+        let auto_tcp_uid = Self::auto_tcp_uid(options);
+        if let Some(uid) = auto_tcp_uid.filter(|uid| tcp_auto_allowed(uid)) {
+            if let Some(ip) = last_local_address(uid) {
+                if let Some(socket) = Self::auto_tcp_attempt(
+                    &discovery,
+                    options,
+                    uid,
+                    ip,
+                    TCP_AUTO_CONNECT_WAIT,
+                    "last known address",
+                )
+                .await
+                {
+                    return Ok(CameraLocation::Tcp(socket));
                 }
             }
         }
@@ -334,6 +360,23 @@ impl BcCamera {
                                 uid_local,
                                 disc.get_addr()
                             );
+                            // No (usable) saved address was tried above — first
+                            // run, or the camera changed IP. It has just
+                            // answered from this IP, so try TCP there too.
+                            if let Some(uid) = auto_tcp_uid.filter(|uid| tcp_auto_allowed(uid)) {
+                                if let Some(socket) = Self::auto_tcp_attempt(
+                                    &discovery,
+                                    options,
+                                    uid,
+                                    disc.get_addr().ip(),
+                                    TCP_AUTO_CONNECT_WAIT_AFTER_DISCOVERY,
+                                    "discovered address",
+                                )
+                                .await
+                                {
+                                    return Ok(CameraLocation::Tcp(socket));
+                                }
+                            }
                             Ok(CameraLocation::Udp(disc))
                         },
                         Err(e) => Err(e)
@@ -630,12 +673,17 @@ mod auto_tcp_tests {
 
     #[tokio::test]
     async fn auto_tcp_closed_port_is_refused() {
-        // Grab a free port, then close it so connecting is refused.
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        // Grab a free port, then close it so connecting is refused. Uses
+        // 127.0.0.2 so a concurrently running test (on 127.0.0.1) cannot be
+        // handed the freed port.
+        let listener = std::net::TcpListener::bind("127.0.0.2:0").unwrap();
         let addr = listener.local_addr().unwrap();
         drop(listener);
         let discovery = Discovery::new_with_region(None).await.unwrap();
-        assert_eq!(BcCamera::try_auto_tcp(&discovery, addr, 0).await, Err(true));
+        assert_eq!(
+            BcCamera::try_auto_tcp(&discovery, addr, 0, TCP_AUTO_CONNECT_WAIT).await,
+            Err(true)
+        );
     }
 
     #[tokio::test]
@@ -649,7 +697,7 @@ mod auto_tcp_tests {
         });
         let discovery = Discovery::new_with_region(None).await.unwrap();
         assert_eq!(
-            BcCamera::try_auto_tcp(&discovery, addr, 0).await,
+            BcCamera::try_auto_tcp(&discovery, addr, 0, TCP_AUTO_CONNECT_WAIT).await,
             Err(false)
         );
     }

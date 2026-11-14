@@ -92,6 +92,8 @@ async fn main() -> Result<()> {
     config.resolve_offline_timeouts();
     config.resolve_startup_keyframe_waits();
 
+    utils::seed_saved_addresses(config.stream_cache_path.as_deref());
+
     let neo_reactor = NeoReactor::new(config.clone()).await;
 
     let work_reactor = neo_reactor.clone();

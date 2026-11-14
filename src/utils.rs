@@ -172,3 +172,55 @@ pub(crate) async fn connect_and_login(camera_config: &CameraConfig) -> Result<Bc
 
     Ok(camera)
 }
+
+/// Restore each UID camera's last known LAN address, saved by the status API
+/// in `<dir of stream_cache_path>/snapshots/addresses.json`, before any camera
+/// connects. Cameras in `always` mode connect at startup and stay connected,
+/// so the addresses must be known by then for the automatic TCP attempt to
+/// run (the status API itself only starts after the cameras).
+pub(crate) fn seed_saved_addresses(stream_cache_path: Option<&str>) {
+    let Some(file) = stream_cache_path
+        .filter(|p| !p.is_empty())
+        .and_then(|p| std::path::Path::new(p).parent().map(|d| d.to_path_buf()))
+        .map(|d| d.join("snapshots").join("addresses.json"))
+    else {
+        return;
+    };
+    let Ok(bytes) = std::fs::read(&file) else {
+        return;
+    };
+    let addrs: std::collections::HashMap<String, IpAddr> =
+        serde_json::from_slice(&bytes).unwrap_or_default();
+    for (uid, ip) in addrs.iter() {
+        neolink_core::bc_protocol::remember_local_address(uid, *ip);
+    }
+    if !addrs.is_empty() {
+        info!("Restored last known address of {} camera(s)", addrs.len());
+    }
+}
+
+#[cfg(test)]
+mod seed_tests {
+    use super::*;
+
+    #[test]
+    fn seeds_addresses_saved_next_to_the_stream_cache() {
+        let dir = std::env::temp_dir().join(format!("neolink-seed-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("snapshots")).unwrap();
+        std::fs::write(
+            dir.join("snapshots").join("addresses.json"),
+            r#"{"TESTUIDSEED0001":"192.168.68.99"}"#,
+        )
+        .unwrap();
+        let cache = dir.join("stream-cache.json");
+        seed_saved_addresses(cache.to_str());
+        assert_eq!(
+            neolink_core::bc_protocol::last_local_address("TESTUIDSEED0001"),
+            Some("192.168.68.99".parse().unwrap())
+        );
+        // Missing/empty path: no panic, nothing to do.
+        seed_saved_addresses(None);
+        seed_saved_addresses(Some(""));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
