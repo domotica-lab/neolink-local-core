@@ -82,8 +82,12 @@ impl Drop for StreamData {
         log::trace!("Drop StreamData");
         self.abort_handle.cancel();
         if let Some(handle) = self.handle.take() {
-            let _gt = tokio::runtime::Handle::current().enter();
-            tokio::task::spawn(async move {
+            // Not `enter()`: during runtime shutdown a drop can run inside
+            // tokio's own context access, where entering panics.
+            let Ok(rt) = tokio::runtime::Handle::try_current() else {
+                return;
+            };
+            rt.spawn(async move {
                 let _ = handle.await;
             });
         }

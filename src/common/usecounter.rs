@@ -80,8 +80,12 @@ impl Drop for UseCounter {
         self.cancel.cancel();
 
         let mut set = std::mem::take(&mut self.set);
-        let _gt = tokio::runtime::Handle::current().enter();
-        tokio::task::spawn(async move { while set.join_next().await.is_some() {} });
+        // Not `enter()`: during runtime shutdown a drop can run inside
+        // tokio's own context access, where entering panics.
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        rt.spawn(async move { while set.join_next().await.is_some() {} });
         log::trace!("Dropped UseCounter");
     }
 }

@@ -253,6 +253,10 @@ pub(crate) async fn main(_opt: Opt, reactor: NeoReactor) -> Result<()> {
 /// the camera instance it holds can be torn down underneath it (after a fatal
 /// login error the reactor rebuilds the camera). Without this loop either case
 /// left the camera's RTSP paths dead until Neolink was restarted.
+///
+/// Note the two cases differ: a failed stream task restarts after a backoff,
+/// while a stopped camera keeps its current paths mounted until a rebuilt,
+/// running instance is available, so clients never see a 404 meanwhile.
 async fn supervise_camera(name: &str, reactor: &NeoReactor, rtsp: &NeoRtspServer) -> Result<()> {
     const MIN_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
     const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
@@ -261,20 +265,57 @@ async fn supervise_camera(name: &str, reactor: &NeoReactor, rtsp: &NeoRtspServer
     let mut backoff = MIN_BACKOFF;
     loop {
         let started = std::time::Instant::now();
-        let outcome: Result<()> = match reactor.get(name).await {
-            Ok(camera) => tokio::select! {
-                _ = camera.stopped() => Err(anyhow!("camera instance stopped")),
-                v = camera_main(camera.clone(), rtsp) => v.and_then(|()| Err(anyhow!("stream ended"))),
-            },
-            Err(e) => Err(e),
-        };
-        if let Err(e) = outcome {
-            if started.elapsed() >= HEALTHY_RUN {
-                backoff = MIN_BACKOFF;
+        let camera = match reactor.get(name).await {
+            Ok(camera) => camera,
+            Err(e) => {
+                log::warn!("{name}: RTSP cannot get the camera ({e:#}); retrying in {backoff:?}");
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(MAX_BACKOFF);
+                continue;
             }
-            log::warn!("{name}: RTSP stream stopped ({e:#}); restarting in {backoff:?}");
-            tokio::time::sleep(backoff).await;
-            backoff = (backoff * 2).min(MAX_BACKOFF);
+        };
+        let main = camera_main(camera.clone(), rtsp);
+        tokio::pin!(main);
+        tokio::select! {
+            v = &mut main => {
+                let e = v.err().unwrap_or_else(|| anyhow!("stream ended"));
+                if camera.is_stopped() {
+                    // The camera was rebuilt underneath us (its old config
+                    // watch closed): remount on the new instance right away.
+                    log::info!("{name}: camera rebuilt; restarting its RTSP streams ({e:#})");
+                    continue;
+                }
+                if started.elapsed() >= HEALTHY_RUN {
+                    backoff = MIN_BACKOFF;
+                }
+                log::warn!("{name}: RTSP stream stopped ({e:#}); restarting in {backoff:?}");
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(MAX_BACKOFF);
+            }
+            replacement = async {
+                camera.stopped().await;
+                log::warn!("{name}: camera stopped; RTSP keeps its paths up until it is rebuilt");
+                wait_for_live_camera(name, reactor).await
+            } => {
+                // Swap straight over: the old generation's paths stay mounted
+                // (clients get the placeholder, not a 404, which makes some
+                // NVRs give up for good) until a working instance exists.
+                drop(replacement);
+                log::info!("{name}: camera rebuilt; restarting its RTSP streams");
+            }
+        }
+    }
+}
+
+/// Poll the reactor until it hands out a camera instance that is running (it
+/// rebuilds a stopped camera, at most once per cooldown).
+async fn wait_for_live_camera(name: &str, reactor: &NeoReactor) -> NeoInstance {
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        if let Ok(camera) = reactor.get(name).await {
+            if !camera.is_stopped() {
+                return camera;
+            }
         }
     }
 }

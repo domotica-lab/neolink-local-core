@@ -1227,9 +1227,13 @@ impl Drop for Discoverer {
     fn drop(&mut self) {
         log::trace!("Drop Discoverer");
         self.cancel.cancel();
-        let _gt = tokio::runtime::Handle::current().enter();
+        // Not `enter()`: during runtime shutdown a drop can run inside
+        // tokio's own context access, where entering panics.
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
         let mut handle = std::mem::take(&mut self.handle);
-        tokio::task::spawn(async move { while handle.get_mut().join_next().await.is_some() {} });
+        rt.spawn(async move { while handle.get_mut().join_next().await.is_some() {} });
         log::trace!("Dropped Discoverer");
     }
 }

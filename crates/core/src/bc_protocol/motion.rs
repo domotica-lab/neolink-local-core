@@ -381,8 +381,12 @@ impl Drop for MotionData {
         log::trace!("Drop MotionData");
         self.cancel.cancel();
         let mut handle = std::mem::take(&mut self.handle);
-        let _gt = tokio::runtime::Handle::current().enter();
-        tokio::task::spawn(async move {
+        // Not `enter()`: during runtime shutdown a drop can run inside
+        // tokio's own context access, where entering panics.
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        rt.spawn(async move {
             while handle.join_next().await.is_some() {}
             log::trace!("Dropped MotionData");
         });

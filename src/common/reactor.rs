@@ -205,8 +205,12 @@ impl Drop for NeoReactor {
                 log::trace!("Drop NeoReactor");
                 self.cancel.cancel();
                 let commander = self.commander.clone();
-                let _gt = tokio::runtime::Handle::current().enter();
-                tokio::task::spawn(async move {
+                // Not `enter()`: during runtime shutdown a drop can run inside
+                // tokio's own context access, where entering panics.
+                let Ok(rt) = tokio::runtime::Handle::try_current() else {
+                    return;
+                };
+                rt.spawn(async move {
                     let _ = commander.send(NeoReactorCommand::HangUp).await;
                     while set.join_next().await.is_some() {}
                     log::trace!("Dropped NeoReactor");

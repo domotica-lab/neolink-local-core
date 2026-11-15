@@ -275,6 +275,12 @@ impl NeoInstance {
         self.cancel.cancelled().await
     }
 
+    /// Whether the camera this instance belongs to has stopped.
+    #[cfg_attr(not(feature = "gstreamer"), allow(dead_code))]
+    pub(crate) fn is_stopped(&self) -> bool {
+        self.cancel.is_cancelled()
+    }
+
     pub(crate) fn camera(&self) -> WatchReceiver<Weak<BcCamera>> {
         self.camera_watch.clone()
     }
@@ -349,9 +355,13 @@ where
 {
     fn drop(&mut self) {
         if let (Some(command), Some(instance)) = (self.command.take(), self.instance.take()) {
-            let _gt = tokio::runtime::Handle::current().enter();
+            // Not `enter()`: during runtime shutdown a drop can run inside
+            // tokio's own context access, where entering panics.
+            let Ok(rt) = tokio::runtime::Handle::try_current() else {
+                return;
+            };
             let timeout = self.timeout;
-            tokio::task::spawn(async move {
+            rt.spawn(async move {
                 tokio::time::timeout(timeout, instance.run_passive_task(*command)).await??;
                 crate::AnyResult::Ok(())
             });
