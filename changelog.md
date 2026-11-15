@@ -24,8 +24,12 @@ recovers on its own instead of staying dead until Neolink is restarted.
   that request instead of the whole camera manager.
 - **RTSP paths come back by themselves.** An error in a camera's stream task,
   or a rebuilt camera, used to leave its RTSP paths dead; each camera is now
-  supervised and restarted with a 1–60 s backoff. A camera removed from the
-  config and added back is served again.
+  supervised and restarted with a 1–60 s backoff. While a stopped camera is
+  being rebuilt its paths stay mounted (placeholder, never a 404, which makes
+  some NVRs give up). A camera removed from the config and added back is
+  served again.
+- **No panic on exit.** Neolink could panic with `RefCell already borrowed`
+  while shutting down (e.g. after failing to bind the RTSP port).
 - **Lost connections are detected sooner.** A camera that closes the
   connection is reconnected at once (it used to wait ~50 s for pings to time
   out, or was even treated as a requested shutdown). TCP has a 10 s connect
