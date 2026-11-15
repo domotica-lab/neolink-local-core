@@ -10,7 +10,7 @@ Format loosely based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
-## Unreleased (Neolink Local)
+## 1.0.14 (Neolink Local)
 
 Reliability pass over the camera lifecycle: a camera that hits an error now
 recovers on its own instead of staying dead until Neolink is restarted.
