@@ -15,7 +15,7 @@ use tokio::{
         watch::{channel as watch, Receiver as WatchReceiver, Sender as WatchSender},
     },
     task::JoinSet,
-    time::{sleep, Duration},
+    time::{sleep, Duration, Instant},
 };
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
@@ -47,6 +47,41 @@ pub(crate) struct NeoCam {
     commander: MpscSender<NeoCamCommand>,
     camera_watch: WatchReceiver<Weak<BcCamera>>,
     set: JoinSet<AnyResult<()>>,
+    created_at: Instant,
+}
+
+/// Spawn one of the camera's long-lived tasks. They only end when the camera
+/// is being torn down, so one that stops on its own (error, unexpected
+/// return or panic) leaves the camera half-working: e.g. no connect loop means
+/// it never connects again. Cancelling the shared token instead marks the
+/// whole camera as stopped, so the reactor rebuilds it and the RTSP side
+/// re-attaches to the new one.
+fn spawn_critical<F>(
+    set: &mut JoinSet<AnyResult<()>>,
+    camera: &str,
+    label: &'static str,
+    cancel: &CancellationToken,
+    fut: F,
+) where
+    F: std::future::Future<Output = AnyResult<()>> + Send + 'static,
+{
+    let camera = camera.to_string();
+    let cancel = cancel.clone();
+    set.spawn(async move {
+        // Cancels on drop, so a panic also tears the camera down.
+        let guard = cancel.clone().drop_guard();
+        let res = fut.await;
+        if !cancel.is_cancelled() {
+            match &res {
+                Err(e) => log::error!("{camera}: {label} stopped: {e:?}; restarting the camera"),
+                Ok(()) => {
+                    log::warn!("{camera}: {label} stopped unexpectedly; restarting the camera")
+                }
+            }
+        }
+        drop(guard);
+        res
+    });
 }
 
 impl NeoCam {
@@ -61,7 +96,9 @@ impl NeoCam {
         let set = JoinSet::new();
         let users = UseCounter::new().await;
 
+        let cam_name = config.name.clone();
         let mut me = Self {
+            created_at: Instant::now(),
             cancel: CancellationToken::new(),
             config_watch: watch_config_tx,
             commander: commander_tx.clone(),
@@ -79,68 +116,86 @@ impl NeoCam {
         let thread_commander_tx = commander_tx.clone();
         let thread_watch_config_rx = watch_config_rx.clone();
 
-        me.set.spawn(async move {
-            let thread_cancel = sender_cancel.clone();
-            let res = tokio::select! {
-                _ = sender_cancel.cancelled() => {
-                    Result::Ok(())
-                },
-                v = async {
-                    while let Some(command) = commander_rx.next().await {
-                        match command {
-                            NeoCamCommand::HangUp => {
-                                sender_cancel.cancel();
-                                return Result::<(), anyhow::Error>::Ok(());
-                            }
-                            NeoCamCommand::Instance(result) => {
-                                let instance = NeoInstance::new(
-                                    camera_watch_rx.clone(),
-                                    thread_commander_tx.clone(),
-                                    thread_cancel.clone(),
-                                );
-                                let _ = result.send(instance);
-                            }
-                            NeoCamCommand::Motion(sender) => {
-                                md_request_tx.send(
-                                    MdRequest::Get {
-                                        sender,
-                                    }
-                                ).await?;
-                            },
-                            NeoCamCommand::Doorbell(sender) => {
-                                md_request_tx.send(
-                                    MdRequest::GetDoorbell {
-                                        sender,
-                                    }
-                                ).await?;
-                            },
-                            NeoCamCommand::Config(sender) => {
-                                let _ = sender.send(thread_watch_config_rx.clone());
-                            },
-                            NeoCamCommand::Connect(sender) => {
-                                if !matches!(*state_tx.borrow(), NeoCamThreadState::Connected) {
-                                    state_tx.send_replace(NeoCamThreadState::Connected);
+        spawn_critical(
+            &mut me.set,
+            &cam_name,
+            "command loop",
+            &me.cancel,
+            async move {
+                let thread_cancel = sender_cancel.clone();
+                let res = tokio::select! {
+                    _ = sender_cancel.cancelled() => {
+                        Result::Ok(())
+                    },
+                    v = async {
+                        while let Some(command) = commander_rx.next().await {
+                            match command {
+                                NeoCamCommand::HangUp => {
+                                    sender_cancel.cancel();
+                                    return Result::<(), anyhow::Error>::Ok(());
                                 }
-                                let _ = sender.send(());
-                            }
-                            NeoCamCommand::Disconnect(sender) => {
-                                if !matches!(*state_tx.borrow(), NeoCamThreadState::Disconnected) {
-                                    state_tx.send_replace(NeoCamThreadState::Disconnected);
+                                NeoCamCommand::Instance(result) => {
+                                    let instance = NeoInstance::new(
+                                        camera_watch_rx.clone(),
+                                        thread_commander_tx.clone(),
+                                        thread_cancel.clone(),
+                                    );
+                                    let _ = result.send(instance);
                                 }
-                                let _ = sender.send(());
-                            }
-                            NeoCamCommand::GetPermit(sender) => {
-                                let _ = sender.send(users.create_activated().await?);
+                                // If the motion thread is gone the request (and its
+                                // oneshot) is dropped, so only that caller sees an
+                                // error. Propagating it with `?` would end this
+                                // command loop and leave every other user of the
+                                // camera (permits, connect, config) talking to a dead
+                                // channel.
+                                NeoCamCommand::Motion(sender) => {
+                                    if md_request_tx.send(MdRequest::Get { sender }).await.is_err() {
+                                        log::warn!("Motion watcher requested but the motion thread has stopped");
+                                    }
+                                },
+                                NeoCamCommand::Doorbell(sender) => {
+                                    if md_request_tx.send(MdRequest::GetDoorbell { sender }).await.is_err() {
+                                        log::warn!("Doorbell watcher requested but the motion thread has stopped");
+                                    }
+                                },
+                                NeoCamCommand::Config(sender) => {
+                                    let _ = sender.send(thread_watch_config_rx.clone());
+                                },
+                                NeoCamCommand::Connect(sender) => {
+                                    if !matches!(*state_tx.borrow(), NeoCamThreadState::Connected) {
+                                        state_tx.send_replace(NeoCamThreadState::Connected);
+                                    }
+                                    let _ = sender.send(());
+                                }
+                                NeoCamCommand::Disconnect(sender) => {
+                                    if !matches!(*state_tx.borrow(), NeoCamThreadState::Disconnected) {
+                                        state_tx.send_replace(NeoCamThreadState::Disconnected);
+                                    }
+                                    let _ = sender.send(());
+                                }
+                                NeoCamCommand::GetPermit(sender) => {
+                                    match users.create_activated().await {
+                                        Ok(permit) => {
+                                            let _ = sender.send(permit);
+                                        }
+                                        Err(e) => {
+                                            // The use counter is owned by this task, so this
+                                            // cannot really fail; if it does, fail only this
+                                            // request (the caller sees a closed channel).
+                                            log::warn!("Could not create a camera use permit: {e:?}");
+                                        }
+                                    }
+                                }
                             }
                         }
+                        Ok(())
+                    } => {
+                        v
                     }
-                    Ok(())
-                } => {
-                    v
-                }
-            };
-            res
-        });
+                };
+                res
+            },
+        );
 
         // This gets the first instance which we use for making the other threads
         let (instance_tx, instance_rx) = oneshot();
@@ -160,20 +215,32 @@ impl NeoCam {
             me.cancel.clone(),
         )
         .await;
-        me.set.spawn(async move { cam_thread.run().await });
+        spawn_critical(
+            &mut me.set,
+            &cam_name,
+            "connection thread",
+            &me.cancel,
+            async move { cam_thread.run().await },
+        );
 
         // This thread monitors the motion
         let md_instance = instance.subscribe().await?;
         let md_cancel = me.cancel.clone();
         let mut md_thread = NeoCamMdThread::new(md_request_rx, md_instance).await?;
-        me.set.spawn(async move {
-            tokio::select! {
-                _ = md_cancel.cancelled() => AnyResult::Ok(()),
-                v = md_thread.run() => {
-                    v
-                },
-            }
-        });
+        spawn_critical(
+            &mut me.set,
+            &cam_name,
+            "motion thread",
+            &me.cancel,
+            async move {
+                tokio::select! {
+                    _ = md_cancel.cancelled() => AnyResult::Ok(()),
+                    v = md_thread.run() => {
+                        v
+                    },
+                }
+            },
+        );
 
         // Camera info reporting removed - was triggering connection at startup
         // Model/firmware info and UID queries now happen only when camera is already
@@ -184,30 +251,36 @@ impl NeoCam {
         // MD permits
         let md_permit_instance = instance.subscribe().await?;
         let md_permit_cancel = me.cancel.clone();
-        me.set.spawn(async move {
-            tokio::select! {
-                _ = md_permit_cancel.cancelled() => {
-                    AnyResult::Ok(())
-                },
-                v = async {
-                    let mut md = md_permit_instance.motion().await.with_context(|| "Unable to acquire motion watcher")?;
-                    loop{
-                        md.wait_for(|md| matches!(md, MdState::Start(_))).await.with_context(|| "MD Watcher lost")?;
-                        let _permit = md_permit_instance.permit().await.with_context(|| "Unuable to acquire motion permit")?;
-                        md.wait_for(|md| matches!(md, MdState::Stop(_))).await.with_context(|| "MD Watcher lost")?;
-                        // Try waiting for 30s
-                        // If in those 30s we get motion then return to
-                        // loop early to reaquire the permit
-                        tokio::select!{
-                            _ = sleep(Duration::from_secs(30)) => {},
-                            v = md.wait_for(|md| matches!(md, MdState::Start(_))) => {v.with_context(|| "MD Watcher lost")?;},
+        spawn_critical(
+            &mut me.set,
+            &cam_name,
+            "motion permit watcher",
+            &me.cancel,
+            async move {
+                tokio::select! {
+                    _ = md_permit_cancel.cancelled() => {
+                        AnyResult::Ok(())
+                    },
+                    v = async {
+                        let mut md = md_permit_instance.motion().await.with_context(|| "Unable to acquire motion watcher")?;
+                        loop{
+                            md.wait_for(|md| matches!(md, MdState::Start(_))).await.with_context(|| "MD Watcher lost")?;
+                            let _permit = md_permit_instance.permit().await.with_context(|| "Unuable to acquire motion permit")?;
+                            md.wait_for(|md| matches!(md, MdState::Stop(_))).await.with_context(|| "MD Watcher lost")?;
+                            // Try waiting for 30s
+                            // If in those 30s we get motion then return to
+                            // loop early to reaquire the permit
+                            tokio::select!{
+                                _ = sleep(Duration::from_secs(30)) => {},
+                                v = md.wait_for(|md| matches!(md, MdState::Start(_))) => {v.with_context(|| "MD Watcher lost")?;},
+                            }
                         }
-                    }
-                } => {
-                    v
-                },
-            }
-        });
+                    } => {
+                        v
+                    },
+                }
+            },
+        );
 
         // This thread manages the camera connection lifecycle per `connect_mode`:
         //   - Always:    connect at startup and stay connected; if idle_timeout_secs > 0,
@@ -218,124 +291,130 @@ impl NeoCam {
         // The loop re-reads the config each cycle so changes take effect.
         let connect_instance = instance.subscribe().await?;
         let connect_cancel = me.cancel.clone();
-        me.set.spawn(async move {
-            tokio::select!{
-                _ = connect_cancel.cancelled() => {
-                    AnyResult::Ok(())
-                },
-                v = async {
-                    let mut permit = connect_instance.permit().await?;
-                    permit.deactivate().await?; // Watching only, don't count as active
+        spawn_critical(
+            &mut me.set,
+            &cam_name,
+            "connect lifecycle",
+            &me.cancel,
+            async move {
+                tokio::select! {
+                    _ = connect_cancel.cancelled() => {
+                        AnyResult::Ok(())
+                    },
+                    v = async {
+                        let mut permit = connect_instance.permit().await?;
+                        permit.deactivate().await?; // Watching only, don't count as active
 
-                    let mut config_rx = connect_instance.config().await?;
-                    let name = config_rx.borrow().name.clone();
+                        let mut config_rx = connect_instance.config().await?;
+                        let name = config_rx.borrow().name.clone();
 
-                    'lifecycle: loop {
-                        // Snapshot the mode (and mark the current config as seen so a
-                        // later `changed()` only fires on a genuine config change).
-                        let mode = config_rx.borrow_and_update().connect_mode;
-                        match mode {
-                            ConnectMode::Always => {
-                                // Connect at startup / stay connected (idempotent).
-                                connect_instance.connect().await?;
-                                let idle_timeout = config_rx.borrow().idle_timeout_secs;
-                                if idle_timeout == 0 {
-                                    // Never idle-disconnect; just wait for a config change.
-                                    if config_rx.changed().await.is_err() {
-                                        break;
-                                    }
-                                    continue;
-                                }
-                                // idle_timeout > 0: disconnect after being idle that long.
-                                tokio::select! {
-                                    r = config_rx.changed() => { if r.is_err() { break; } continue; }
-                                    r = permit.dropped_users() => {
-                                        r?;
-                                        let idle_deadline = sleep(Duration::from_secs(idle_timeout));
-                                        tokio::pin!(idle_deadline);
-                                        tokio::select! {
-                                            _ = &mut idle_deadline => {
-                                                log::info!("{name}: idle {idle_timeout}s, disconnecting (connect_mode=always)");
-                                                connect_instance.disconnect().await?;
-                                                // Reconnect on demand (or re-evaluate on config change).
-                                                tokio::select! {
-                                                    r = permit.aquired_users() => { r?; }
-                                                    r = config_rx.changed() => { if r.is_err() { break; } }
-                                                }
-                                            }
-                                            // Re-used before timeout: stay connected.
-                                            r = permit.aquired_users() => { r?; }
-                                            r = config_rx.changed() => { if r.is_err() { break; } }
+                        'lifecycle: loop {
+                            // Snapshot the mode (and mark the current config as seen so a
+                            // later `changed()` only fires on a genuine config change).
+                            let mode = config_rx.borrow_and_update().connect_mode;
+                            match mode {
+                                ConnectMode::Always => {
+                                    // Connect at startup / stay connected (idempotent).
+                                    connect_instance.connect().await?;
+                                    let idle_timeout = config_rx.borrow().idle_timeout_secs;
+                                    if idle_timeout == 0 {
+                                        // Never idle-disconnect; just wait for a config change.
+                                        if config_rx.changed().await.is_err() {
+                                            break;
                                         }
                                         continue;
                                     }
-                                }
-                            }
-                            ConnectMode::OnDemand => {
-                                // Wait for demand before connecting.
-                                tokio::select! {
-                                    r = config_rx.changed() => { if r.is_err() { break; } continue; }
-                                    r = permit.aquired_users() => { r?; }
-                                }
-                                log::info!("{name}: Permit acquired, connecting to camera relay");
-                                connect_instance.connect().await?;
-
-                                // Stay connected until all permits drop, plus a warm grace.
-                                loop {
-                                    // Wait for users to drop, but also react to config
-                                    // changes (e.g. connect_mode) while connected. Users
-                                    // are present here, so re-evaluating re-reads the mode
-                                    // without dropping the active stream (connect() is
-                                    // idempotent and aquired_users() returns immediately).
+                                    // idle_timeout > 0: disconnect after being idle that long.
                                     tokio::select! {
-                                        r = permit.dropped_users() => { r?; }
-                                        r = config_rx.changed() => {
-                                            if r.is_err() { break 'lifecycle; }
-                                            log::info!("{name}: config changed; re-evaluating connect mode");
-                                            continue 'lifecycle;
-                                        }
-                                    }
-                                    let warm_secs = config_rx.borrow().relay_warm_seconds;
-                                    if warm_secs == 0 {
-                                        break;
-                                    }
-                                    log::info!(
-                                        "{name}: All permits dropped, keeping relay warm for {}s",
-                                        warm_secs
-                                    );
-                                    let warm_deadline = sleep(Duration::from_secs(warm_secs));
-                                    tokio::pin!(warm_deadline);
-                                    tokio::select! {
-                                        _ = &mut warm_deadline => {
-                                            break;
-                                        }
-                                        v = permit.aquired_users() => {
-                                            v?;
-                                            log::info!("{name}: Permit reacquired during warm relay window");
+                                        r = config_rx.changed() => { if r.is_err() { break; } continue; }
+                                        r = permit.dropped_users() => {
+                                            r?;
+                                            let idle_deadline = sleep(Duration::from_secs(idle_timeout));
+                                            tokio::pin!(idle_deadline);
+                                            tokio::select! {
+                                                _ = &mut idle_deadline => {
+                                                    log::info!("{name}: idle {idle_timeout}s, disconnecting (connect_mode=always)");
+                                                    connect_instance.disconnect().await?;
+                                                    // Reconnect on demand (or re-evaluate on config change).
+                                                    tokio::select! {
+                                                        r = permit.aquired_users() => { r?; }
+                                                        r = config_rx.changed() => { if r.is_err() { break; } }
+                                                    }
+                                                }
+                                                // Re-used before timeout: stay connected.
+                                                r = permit.aquired_users() => { r?; }
+                                                r = config_rx.changed() => { if r.is_err() { break; } }
+                                            }
                                             continue;
                                         }
-                                        r = config_rx.changed() => {
-                                            if r.is_err() { break 'lifecycle; }
-                                            // No active users during the warm window, so
-                                            // ending it (disconnect) to re-evaluate the mode
-                                            // is safe and disrupts nothing.
-                                            log::info!("{name}: config changed during warm window; re-evaluating");
-                                            break;
-                                        }
                                     }
                                 }
+                                ConnectMode::OnDemand => {
+                                    // Wait for demand before connecting.
+                                    tokio::select! {
+                                        r = config_rx.changed() => { if r.is_err() { break; } continue; }
+                                        r = permit.aquired_users() => { r?; }
+                                    }
+                                    log::info!("{name}: Permit acquired, connecting to camera relay");
+                                    connect_instance.connect().await?;
 
-                                log::info!("{name}: All permits dropped, disconnecting from camera relay");
-                                connect_instance.disconnect().await?;
+                                    // Stay connected until all permits drop, plus a warm grace.
+                                    loop {
+                                        // Wait for users to drop, but also react to config
+                                        // changes (e.g. connect_mode) while connected. Users
+                                        // are present here, so re-evaluating re-reads the mode
+                                        // without dropping the active stream (connect() is
+                                        // idempotent and aquired_users() returns immediately).
+                                        tokio::select! {
+                                            r = permit.dropped_users() => { r?; }
+                                            r = config_rx.changed() => {
+                                                if r.is_err() { break 'lifecycle; }
+                                                log::info!("{name}: config changed; re-evaluating connect mode");
+                                                continue 'lifecycle;
+                                            }
+                                        }
+                                        let warm_secs = config_rx.borrow().relay_warm_seconds;
+                                        if warm_secs == 0 {
+                                            break;
+                                        }
+                                        log::info!(
+                                            "{name}: All permits dropped, keeping relay warm for {}s",
+                                            warm_secs
+                                        );
+                                        let warm_deadline = sleep(Duration::from_secs(warm_secs));
+                                        tokio::pin!(warm_deadline);
+                                        tokio::select! {
+                                            _ = &mut warm_deadline => {
+                                                break;
+                                            }
+                                            v = permit.aquired_users() => {
+                                                v?;
+                                                log::info!("{name}: Permit reacquired during warm relay window");
+                                                continue;
+                                            }
+                                            r = config_rx.changed() => {
+                                                if r.is_err() { break 'lifecycle; }
+                                                // No active users during the warm window, so
+                                                // ending it (disconnect) to re-evaluate the mode
+                                                // is safe and disrupts nothing.
+                                                log::info!("{name}: config changed during warm window; re-evaluating");
+                                                break;
+                                            }
+                                        }
+                                    }
+
+                                    log::info!("{name}: All permits dropped, disconnecting from camera relay");
+                                    connect_instance.disconnect().await?;
+                                }
                             }
                         }
-                    }
-                    AnyResult::Ok(())
-                } => {
-                    v
-                },
-            }
-        });
+                        AnyResult::Ok(())
+                    } => {
+                        v
+                    },
+                }
+            },
+        );
 
         Ok(me)
     }
@@ -349,6 +428,14 @@ impl NeoCam {
         !self.cancel.is_cancelled()
     }
 
+    /// How long ago this camera was created. The reactor uses it to rebuild a
+    /// stopped camera at most once per cooldown, so a camera whose login keeps
+    /// failing is not hammered (and its account not locked) by every status
+    /// poll.
+    pub(crate) fn age(&self) -> Duration {
+        self.created_at.elapsed()
+    }
+
     pub(crate) async fn subscribe(&self) -> Result<NeoInstance> {
         NeoInstance::new(
             self.camera_watch.clone(),
@@ -357,8 +444,19 @@ impl NeoCam {
         )
     }
 
+    /// Push a new config to this camera's tasks. Nothing is sent when it is
+    /// identical to the current one: every receiver treats a change as a
+    /// reason to act (the connection thread reconnects on any change), so a
+    /// reload that only touched another camera must not drop this one.
     pub(crate) async fn update_config(&self, config: CameraConfig) -> Result<()> {
-        self.config_watch.send_replace(config);
+        self.config_watch.send_if_modified(|current| {
+            if *current == config {
+                false
+            } else {
+                *current = config;
+                true
+            }
+        });
         Ok(())
     }
 }
@@ -374,5 +472,51 @@ impl Drop for NeoCam {
             while set.join_next().await.is_some() {}
             log::trace!("Dropped NeoCam");
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_failed_task_stops_the_camera() {
+        let cancel = CancellationToken::new();
+        let mut set = JoinSet::new();
+        spawn_critical(&mut set, "cam", "test task", &cancel, async {
+            Err(anyhow::anyhow!("boom"))
+        });
+        set.join_next().await;
+        assert!(cancel.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn an_unexpected_return_or_panic_stops_the_camera() {
+        let cancel = CancellationToken::new();
+        let mut set = JoinSet::new();
+        spawn_critical(&mut set, "cam", "test task", &cancel, async { Ok(()) });
+        set.join_next().await;
+        assert!(cancel.is_cancelled());
+
+        let cancel = CancellationToken::new();
+        let mut set = JoinSet::new();
+        spawn_critical(&mut set, "cam", "test task", &cancel, async {
+            panic!("task panicked")
+        });
+        assert!(set.join_next().await.unwrap().is_err());
+        assert!(cancel.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn a_running_task_leaves_the_camera_alive() {
+        let cancel = CancellationToken::new();
+        let mut set = JoinSet::new();
+        spawn_critical(&mut set, "cam", "test task", &cancel, async {
+            futures::future::pending::<()>().await;
+            Ok(())
+        });
+        tokio::task::yield_now().await;
+        assert!(!cancel.is_cancelled());
+        set.abort_all();
     }
 }

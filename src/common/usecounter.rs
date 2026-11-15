@@ -37,6 +37,11 @@ impl UseCounter {
                             if noti {
                                 log::trace!("Usecounter: {}->{}", *value, (*value) + 1);
                                 *value += 1;
+                            } else if *value == 0 {
+                                // Never wrap: a wrapped count would look like
+                                // ~4 billion users and keep the camera
+                                // connected forever.
+                                log::warn!("Usecounter: release without a matching acquire; ignored");
                             } else {
                                 log::trace!("Usecounter: {}->{}", *value, (*value) - 1);
                                 *value -= 1;

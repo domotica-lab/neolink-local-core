@@ -26,6 +26,10 @@ enum NeoReactorCommand {
     Get(String, OneshotSender<Result<Option<NeoInstance>>>),
 }
 
+/// Minimum lifetime of a camera instance before a stopped one is rebuilt on
+/// request (config reloads always rebuild).
+const RECREATE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Reactor handles the collection of cameras
 #[derive(Clone)]
 pub(crate) struct NeoReactor {
@@ -65,8 +69,17 @@ impl NeoReactor {
                                 let _ = reply.send(thread_config_tx.subscribe());
                             }
                             NeoReactorCommand::Get(name, sender) => {
-                                let new = match instances.entry(name.clone()) {
+                                // Evaluated in its own block so a failure only fails this
+                                // request: a `?` here would otherwise end the reactor loop
+                                // and with it every camera.
+                                let new: Result<Option<NeoInstance>> = async { match instances.entry(name.clone()) {
                                     Entry::Occupied(occ) if occ.get().is_alive() => Result::Ok(Some(occ.get().subscribe().await?)),
+                                    // Stopped, but only just created: hand back the stopped
+                                    // instance (its calls fail cleanly) rather than rebuilding
+                                    // it on every request. A camera whose login is rejected
+                                    // would otherwise retry the login on every status-API poll
+                                    // and risk locking the camera account.
+                                    Entry::Occupied(occ) if occ.get().age() < RECREATE_COOLDOWN => Result::Ok(Some(occ.get().subscribe().await?)),
                                     Entry::Occupied(mut occ) => {
                                         // Entry exists but its NeoCam was torn down (e.g. a
                                         // CameraLoginFail cancelled it). Rebuild from the current
@@ -99,7 +112,10 @@ impl NeoReactor {
                                             Result::Ok(None)
                                         }
                                     }
-                                };
+                                }}.await;
+                                if let Err(e) = &new {
+                                    log::warn!("{name}: could not start the camera: {e:?}");
+                                }
                                 let _ = sender.send(new);
                             },
                             NeoReactorCommand::UpdateConfig(mut new_conf, reply) => {

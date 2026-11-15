@@ -75,7 +75,12 @@ impl BcConnection {
                     while let Some(bc) = source.next().await {
                         sender.send(PollCommand::Bc(Box::new(bc))).await?;
                     }
-                    Result::Ok(())
+                    // The camera closed the connection (e.g. TCP EOF). Report it
+                    // as an error: an `Ok` here would leave `join()` waiting on
+                    // the other tasks, which never end on their own, so the loss
+                    // would only be noticed once keepalive pings time out.
+                    debug!("Camera connection closed by the remote end");
+                    Result::Err(Error::DroppedConnection)
                 } => v
             }
         });
@@ -527,5 +532,20 @@ mod tests {
             received, 1,
             "expected exactly one buffered message in the full subscriber channel"
         );
+    }
+
+    /// A camera that closes the connection (source stream ends) must make
+    /// `join()` report the loss promptly instead of waiting forever on the
+    /// sink and poller tasks, which never end on their own.
+    #[tokio::test]
+    async fn closed_source_ends_join_with_dropped_connection() {
+        let sink: BcConnSink =
+            Box::new(futures::sink::drain().sink_map_err(|e: std::convert::Infallible| match e {}));
+        let source: BcConnSource = Box::new(futures::stream::empty::<Result<Bc>>());
+        let conn = BcConnection::new(sink, source).await.unwrap();
+        let res = timeout(Duration::from_secs(2), conn.join())
+            .await
+            .expect("join() must return once the source has ended");
+        assert!(matches!(res, Err(Error::DroppedConnection)), "{res:?}");
     }
 }

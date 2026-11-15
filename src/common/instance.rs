@@ -267,6 +267,14 @@ impl NeoInstance {
         Ok(instance_rx.await?)
     }
 
+    /// Resolves once the camera this instance belongs to has stopped (torn
+    /// down after a fatal error or removed). Holders should then fetch a fresh
+    /// instance from the reactor, which rebuilds the camera.
+    #[cfg_attr(not(feature = "gstreamer"), allow(dead_code))]
+    pub(crate) async fn stopped(&self) {
+        self.cancel.cancelled().await
+    }
+
     pub(crate) fn camera(&self) -> WatchReceiver<Weak<BcCamera>> {
         self.camera_watch.clone()
     }

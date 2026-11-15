@@ -61,8 +61,11 @@ impl NeoCamThread {
                 AnyResult::Ok(())
             }
             v = camera.join() => {
+                // The connection's tasks only end when it is lost; a clean end
+                // still means the camera is gone, so reconnect rather than
+                // treating it as a requested shutdown.
                 v?;
-                Ok(())
+                Err(anyhow::anyhow!("Camera connection closed"))
             },
             v = async {
                 let mut interval = interval(Duration::from_secs(5));
@@ -163,7 +166,7 @@ impl NeoCamThread {
 
             match result {
                 Ok(()) => {
-                    // Normal shutdown
+                    // Only returned once cancelled: a requested shutdown.
                     log::trace!("Normal camera shutdown");
                     self.cancel.cancel();
                     return Ok(());

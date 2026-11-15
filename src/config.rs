@@ -23,7 +23,7 @@ static RE_MAXENC_SRC: Lazy<Regex> = Lazy::new(|| {
 
 #[derive(Debug, Deserialize, Serialize, Validate, Clone, PartialEq)]
 pub(crate) struct Config {
-    #[validate(nested)]
+    #[validate(nested, custom(function = "validate_camera_names"))]
     pub(crate) cameras: Vec<CameraConfig>,
 
     #[serde(rename = "bind", default = "default_bind_addr")]
@@ -698,6 +698,24 @@ fn validate_username(name: &str) -> Result<(), ValidationError> {
     Ok(())
 }
 
+/// Cameras are addressed by name everywhere (reactor, RTSP paths, status
+/// API), so a duplicate would silently serve the first camera under both
+/// entries and never start the second.
+fn validate_camera_names(cameras: &[CameraConfig]) -> Result<(), ValidationError> {
+    let mut seen = HashSet::new();
+    for cam in cameras {
+        if cam.name.trim().is_empty() {
+            return Err(ValidationError::new("camera name cannot be empty"));
+        }
+        if !seen.insert(cam.name.as_str()) {
+            let mut err = ValidationError::new("duplicate camera name");
+            err.message = Some(format!("camera name {:?} is used more than once", cam.name).into());
+            return Err(err);
+        }
+    }
+    Ok(())
+}
+
 fn validate_camera_config(camera_config: &CameraConfig) -> Result<(), ValidationError> {
     match (&camera_config.camera_addr, &camera_config.camera_uid) {
         (None, None) => Err(ValidationError::new(
@@ -775,6 +793,20 @@ password = "pass"
         config.resolve_startup_keyframe_waits();
 
         assert_eq!(config.cameras[0].startup_keyframe_wait_secs, Some(0));
+    }
+
+    #[test]
+    fn duplicate_camera_names_are_rejected() {
+        let mut config = minimal_config("", "");
+        assert!(config.validate().is_ok());
+        let mut second = config.cameras[0].clone();
+        second.camera_uid = Some("other".to_string());
+        config.cameras.push(second.clone());
+        assert!(config.validate().is_err());
+        config.cameras[1].name = "cam2".to_string();
+        assert!(config.validate().is_ok());
+        config.cameras[1].name = "  ".to_string();
+        assert!(config.validate().is_err());
     }
 
     #[test]

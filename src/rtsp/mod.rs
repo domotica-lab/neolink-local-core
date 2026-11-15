@@ -178,23 +178,29 @@ pub(crate) async fn main(_opt: Opt, reactor: NeoReactor) -> Result<()> {
                             let thread_reactor2 = thread_reactor.clone();
                             let name = name.clone();
                             set.spawn(async move {
-                                let camera = thread_reactor2.get(&name).await?;
                                 tokio::select!(
-                                    _ = thread_global_cancel.cancelled() => {
-                                        AnyResult::Ok(())
-                                    },
-                                    _ = local_cancel.cancelled() => {
-                                        AnyResult::Ok(())
-                                    },
-                                    v = camera_main(camera, &thread_rtsp2) => v,
+                                    _ = thread_global_cancel.cancelled() => AnyResult::Ok(()),
+                                    _ = local_cancel.cancelled() => AnyResult::Ok(()),
+                                    v = supervise_camera(&name, &thread_reactor2, &thread_rtsp2) => v,
                                 )
                             }) ;
                         }
                     }
 
-                    for (running_name, token) in cameras.iter() {
-                        if ! config_names.contains(running_name) {
+                    // Stop removed cameras and forget them, so a camera that is
+                    // re-added later is started again.
+                    cameras.retain(|running_name, token| {
+                        if config_names.contains(running_name) {
+                            true
+                        } else {
                             token.cancel();
+                            false
+                        }
+                    });
+                    // Reap finished per-camera tasks.
+                    while let Some(res) = set.try_join_next() {
+                        if let Err(e) = res {
+                            log::error!("RTSP camera task panicked: {e}");
                         }
                     }
                 }
@@ -239,6 +245,38 @@ pub(crate) async fn main(_opt: Opt, reactor: NeoReactor) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Serve one camera over RTSP for as long as it stays in the config.
+///
+/// `camera_main` only returns on an error (e.g. its stream task failed) and
+/// the camera instance it holds can be torn down underneath it (after a fatal
+/// login error the reactor rebuilds the camera). Without this loop either case
+/// left the camera's RTSP paths dead until Neolink was restarted.
+async fn supervise_camera(name: &str, reactor: &NeoReactor, rtsp: &NeoRtspServer) -> Result<()> {
+    const MIN_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
+    const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
+    // A run this long counts as healthy and resets the backoff.
+    const HEALTHY_RUN: std::time::Duration = std::time::Duration::from_secs(60);
+    let mut backoff = MIN_BACKOFF;
+    loop {
+        let started = std::time::Instant::now();
+        let outcome: Result<()> = match reactor.get(name).await {
+            Ok(camera) => tokio::select! {
+                _ = camera.stopped() => Err(anyhow!("camera instance stopped")),
+                v = camera_main(camera.clone(), rtsp) => v.and_then(|()| Err(anyhow!("stream ended"))),
+            },
+            Err(e) => Err(e),
+        };
+        if let Err(e) = outcome {
+            if started.elapsed() >= HEALTHY_RUN {
+                backoff = MIN_BACKOFF;
+            }
+            log::warn!("{name}: RTSP stream stopped ({e:#}); restarting in {backoff:?}");
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(MAX_BACKOFF);
+        }
+    }
 }
 
 /// This keeps the users in rtsp and the config in sync
