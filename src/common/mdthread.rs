@@ -93,7 +93,14 @@ impl NeoCamMdThread {
                 Ok(())
             } => v,
             v = async {
+                // A camera that keeps rejecting the alarm subscription would
+                // otherwise be asked again every second for as long as it is
+                // connected; back off, and start over after a healthy run.
+                const MIN_BACKOFF: Duration = Duration::from_secs(1);
+                const MAX_BACKOFF: Duration = Duration::from_secs(60);
+                let mut backoff = MIN_BACKOFF;
                 loop {
+                    let started = Instant::now();
                     let r: AnyResult<()> = md_instance.run_passive_task(|cam| {
                         let watcher = watcher.clone();
                         let doorbell_sender = doorbell_sender.clone();
@@ -143,8 +150,12 @@ impl NeoCamMdThread {
                             }
                         }
                     )}).await;
-                    log::debug!("Error in MD task Restarting: {:?}", r);
-                    sleep(Duration::from_secs(1)).await;
+                    if started.elapsed() >= MAX_BACKOFF {
+                        backoff = MIN_BACKOFF;
+                    }
+                    log::debug!("Error in MD task, restarting in {backoff:?}: {:?}", r);
+                    sleep(backoff).await;
+                    backoff = (backoff * 2).min(MAX_BACKOFF);
                 }
             } => v
         }

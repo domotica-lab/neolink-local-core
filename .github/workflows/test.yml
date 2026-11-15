@@ -37,3 +37,6 @@ jobs:
 
       - name: Run tests
         run: cargo test --workspace
+
+      - name: Run tests without GStreamer features
+        run: cargo test --workspace --no-default-features

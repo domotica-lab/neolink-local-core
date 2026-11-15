@@ -68,7 +68,7 @@ impl UseCounter {
         Ok(res)
     }
 
-    #[cfg(feature = "gstreamer")]
+    #[cfg_attr(not(feature = "gstreamer"), allow(dead_code))]
     pub(crate) async fn create_deactivated(&self) -> Result<Permit> {
         Ok(Permit::new(self))
     }
@@ -101,18 +101,22 @@ impl Permit {
         }
     }
 
+    // The flag changes only once the message is sent: if the caller drops
+    // the future mid-send, nothing was counted and the flag still matches the
+    // counter, so the drop does not release a use that was never added (which
+    // would take one away from another user and could disconnect it).
     pub(crate) async fn activate(&mut self) -> Result<()> {
         if !self.is_active {
+            self.notifier.send(true).await?;
             self.is_active = true;
-            self.notifier.send(self.is_active).await?;
         }
         Ok(())
     }
 
     pub(crate) async fn deactivate(&mut self) -> Result<()> {
         if self.is_active {
+            self.notifier.send(false).await?;
             self.is_active = false;
-            self.notifier.send(self.is_active).await?;
         }
         Ok(())
     }
@@ -144,12 +148,60 @@ impl Drop for Permit {
     fn drop(&mut self) {
         if self.is_active {
             self.is_active = false;
-            let _gt = tokio::runtime::Handle::current().enter();
-            let notifier = self.notifier.clone();
-            let is_active = self.is_active;
-            tokio::task::spawn(async move {
-                let _ = notifier.send(is_active).await;
-            });
+            // Usually there is room: release right away, without a task.
+            match self.notifier.try_send(false) {
+                Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    // A release must never be lost (the camera would stay
+                    // connected), so queue it. `try_current` keeps a drop
+                    // outside the runtime (e.g. on a GStreamer thread) from
+                    // panicking.
+                    match tokio::runtime::Handle::try_current() {
+                        Ok(handle) => {
+                            let notifier = self.notifier.clone();
+                            handle.spawn(async move {
+                                let _ = notifier.send(false).await;
+                            });
+                        }
+                        Err(_) => {
+                            let _ = self.notifier.blocking_send(false);
+                        }
+                    }
+                }
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    async fn count_settles_at(permit: &Permit, want: u32) {
+        let mut value = permit.value.clone();
+        tokio::time::timeout(Duration::from_secs(2), value.wait_for(|v| *v == want))
+            .await
+            .expect("use count did not settle")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn permits_count_users_and_release_on_drop() {
+        let counter = UseCounter::new().await;
+        let watcher = counter.create_deactivated().await.unwrap();
+        let a = counter.create_activated().await.unwrap();
+        let mut b = counter.create_activated().await.unwrap();
+        count_settles_at(&watcher, 2).await;
+        b.deactivate().await.unwrap();
+        b.deactivate().await.unwrap(); // idempotent
+        count_settles_at(&watcher, 1).await;
+        drop(a);
+        count_settles_at(&watcher, 0).await;
+        drop(b); // inactive: releases nothing
+        b = counter.create_activated().await.unwrap();
+        count_settles_at(&watcher, 1).await;
+        drop(b);
+        count_settles_at(&watcher, 0).await;
     }
 }
