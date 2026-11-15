@@ -79,11 +79,32 @@ and [discovery-handshake.md](discovery-handshake.md)).
   lasted longer than 60 s.
 - A 5 s keep-alive ping (`get_linktype`) tolerates up to 5 missed pings before
   declaring the link dead; cameras that don't support pings are not timed out this way.
-- **Fatal vs retryable:** a login failure (`CameraLoginFail`) is fatal — it cancels
-  and stops (no reconnect loop). All other losses are retried with backoff. A clean
-  shutdown stops cleanly.
+- **Fatal vs retryable:** a login failure (`CameraLoginFail`) is fatal for that
+  camera instance — it cancels and stops (no reconnect loop of its own). All other
+  losses are retried with backoff, including a connection that ends without an error
+  (the camera closed it): only a requested shutdown stops the loop.
 - On exit it best-effort logs out and shuts the camera down. A live connection is also
-  torn down early if the config changes or the state flips to `Disconnected`.
+  torn down early if the camera's config changes (an identical config pushed by a
+  reload is ignored) or the state flips to `Disconnected`.
+- **Detecting a lost link:** a remote close ends `BcConnection::join()` with
+  `DroppedConnection` at once. TCP connections have a 10 s connect timeout,
+  keepalive (10 s idle, 5 s × 3 probes) and a 30 s user timeout on Linux, so a camera
+  that loses power is noticed in seconds rather than after kernel retransmit limits.
+
+## Recovering a stopped camera
+
+Every long-lived task of a `NeoCam` (command loop, connection thread, motion thread,
+motion-permit watcher, connect lifecycle) cancels the camera's shared token if it
+stops on its own — error, unexpected return or panic — so a camera is never left
+half-working. A stopped camera is rebuilt from the current config:
+
+- by the reactor on the next `get(name)`, at most once per 60 s per camera (so a
+  rejected login is not retried on every status-API poll and does not lock the
+  camera account), and always on a config reload;
+- the RTSP side supervises each camera (`supervise_camera` in `src/rtsp/mod.rs`):
+  when its stream task fails or its `NeoInstance` reports `stopped()`, it fetches a
+  fresh instance and restarts, with a 1 s → 60 s backoff that resets after a minute of
+  healthy running. MQTT restarts its per-camera handler every 5 s the same way.
 
 ## Waking a fully-disconnected camera
 

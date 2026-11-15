@@ -10,6 +10,42 @@ Format loosely based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## Unreleased (Neolink Local)
+
+Reliability pass over the camera lifecycle: a camera that hits an error now
+recovers on its own instead of staying dead until Neolink is restarted.
+
+- **A failed camera task restarts the camera.** If any of a camera's internal
+  tasks (command loop, connection, motion, connect lifecycle) stopped, the
+  camera kept looking alive but could never connect again. Now the camera is
+  torn down and rebuilt from the config (at most once a minute, so a rejected
+  login is not retried on every status poll). The command loop no longer dies
+  when the motion thread is gone, and a camera that fails to start fails only
+  that request instead of the whole camera manager.
+- **RTSP paths come back by themselves.** An error in a camera's stream task,
+  or a rebuilt camera, used to leave its RTSP paths dead; each camera is now
+  supervised and restarted with a 1–60 s backoff. A camera removed from the
+  config and added back is served again.
+- **Lost connections are detected sooner.** A camera that closes the
+  connection is reconnected at once (it used to wait ~50 s for pings to time
+  out, or was even treated as a requested shutdown). TCP has a 10 s connect
+  timeout (was ~2 min), keepalive and a 30 s user timeout, so a camera that
+  loses power is noticed in seconds.
+- **Config reloads only touch changed cameras.** Any reload (MQTT `config`)
+  reconnected every camera; now only cameras whose config changed reconnect,
+  and Neolink's own retained MQTT config echoing back is no longer seen as a
+  change.
+- **Use permits cannot be lost or double-released**, which could keep a camera
+  connected forever or disconnect one that was still being watched.
+- Motion detection backs off (up to 60 s) when the camera keeps rejecting the
+  alarm subscription, instead of asking every second.
+- Status API: answers 503 instead of dropping the connection when status is not
+  ready; response writes are time-limited.
+- Config validation rejects empty and duplicate camera names (a duplicate was
+  silently served as the first camera).
+- CI: a new `Tests` workflow runs `cargo fmt --check` and the tests (with and
+  without GStreamer) on every push and pull request.
+
 ## 1.0.13 (Neolink Local)
 
 - **Back to a fixed 500 ms UDP gap wait (adaptive wait disabled).** The
