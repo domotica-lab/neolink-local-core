@@ -299,6 +299,12 @@ pub(crate) async fn main(_: Opt, reactor: NeoReactor) -> Result<()> {
                             continue;
                         }
 
+                        // Compare like with like: the live config has its
+                        // per-camera defaults resolved, the received one not yet.
+                        // Without this, Neolink's own retained `config` message
+                        // echoing back looked like a change and triggered a reload.
+                        config.resolve_offline_timeouts();
+                        config.resolve_startup_keyframe_waits();
                         if (*thread_config.borrow()) == config {
                             continue;
                         }

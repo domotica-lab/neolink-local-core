@@ -152,7 +152,13 @@ async fn handle(
     let response = if method != "GET" {
         Response::text(405, "only GET is supported")
     } else if path == "/api/status" {
-        Response::json(status(&reactor, snapshot_dir.as_deref()).await?)
+        match status(&reactor, snapshot_dir.as_deref()).await {
+            Ok(v) => Response::json(v),
+            Err(e) => {
+                log::debug!("Status API: status failed: {e:?}");
+                Response::text(503, "not ready")
+            }
+        }
     } else if let Some(name) = path
         .strip_prefix("/api/cameras/")
         .and_then(|rest| rest.strip_suffix("/snapshot.jpg"))
@@ -166,7 +172,10 @@ async fn handle(
     } else {
         Response::text(404, "not found")
     };
-    socket.write_all(&response.into_bytes()).await?;
+    // Bounded, so a client that stops reading cannot pin this task forever.
+    tokio::time::timeout(REQUEST_TIMEOUT, socket.write_all(&response.into_bytes()))
+        .await
+        .context("timed out writing response")??;
     socket.shutdown().await.ok();
     Ok(())
 }
